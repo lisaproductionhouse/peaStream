@@ -1,0 +1,11 @@
+# Công cụ nhỏ (độc lập, không thuộc workspace) để tạo fixture HE-AAC cho test của fbaudio-core.
+# Dùng bộ mã hóa FDK-AAC (đi kèm crate `fdk-aac`; cần trình biên dịch C++).
+[package]
+name = "he-fixtures"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fdk-aac = "0.8"
+
+[workspace]

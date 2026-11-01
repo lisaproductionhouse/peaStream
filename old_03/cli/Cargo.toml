@@ -1,0 +1,17 @@
+[package]
+name = "fbaudio-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fbaudio"
+path = "src/main.rs"
+
+[features]
+# Giải mã HE-AAC đầy đủ (SBR + PS) bằng FDK-AAC; cần trình biên dịch C++
+sbr = ["fbaudio-core/sbr"]
+
+[dependencies]
+fbaudio-core = { path = "../core" }
+anyhow = "1"
+log = "0.4"

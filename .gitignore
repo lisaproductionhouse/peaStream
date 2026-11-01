@@ -1,0 +1,5 @@
+/target
+/app/src-tauri/target
+/app/src-tauri/gen/schemas
+__pycache__/
+*.wav

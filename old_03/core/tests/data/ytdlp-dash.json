@@ -1,0 +1,72 @@
+{
+ "_type": "video",
+ "id": "manifest",
+ "title": "manifest",
+ "extractor": "generic",
+ "extractor_key": "Generic",
+ "webpage_url": "http://127.0.0.1:8770/manifest.mpd",
+ "original_url": "http://127.0.0.1:8770/manifest.mpd",
+ "live_status": null,
+ "formats": [
+  {
+   "format_id": "1",
+   "manifest_url": "http://127.0.0.1:8770/manifest.mpd",
+   "ext": "m4a",
+   "tbr": 64.0,
+   "asr": 44100,
+   "format_note": "DASH audio",
+   "container": "m4a_dash",
+   "vcodec": "none",
+   "acodec": "mp4a.40.2",
+   "url": "http://127.0.0.1:8770/manifest.mpd",
+   "fragment_base_url": "http://127.0.0.1:8770/",
+   "protocol": "http_dash_segments",
+   "abr": 64.0,
+   "http_headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-us,en;q=0.5",
+    "Sec-Fetch-Mode": "navigate"
+   },
+   "fragments": [
+    {
+     "path": "init-1.m4s"
+    },
+    {
+     "path": "chunk-1-00001.m4s",
+     "duration": 1.9969160997732427
+    }
+   ]
+  },
+  {
+   "format_id": "0",
+   "manifest_url": "http://127.0.0.1:8770/manifest.mpd",
+   "ext": "mp4",
+   "tbr": 80.0,
+   "asr": null,
+   "format_note": "DASH video",
+   "container": "mp4_dash",
+   "vcodec": "avc1.f4000a",
+   "acodec": "none",
+   "url": "http://127.0.0.1:8770/manifest.mpd",
+   "fragment_base_url": "http://127.0.0.1:8770/",
+   "protocol": "http_dash_segments",
+   "abr": 0,
+   "http_headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-us,en;q=0.5",
+    "Sec-Fetch-Mode": "navigate"
+   },
+   "fragments": [
+    {
+     "path": "init-0.m4s"
+    },
+    {
+     "path": "chunk-0-00001.m4s",
+     "duration": 2.0
+    }
+   ]
+  }
+ ]
+}

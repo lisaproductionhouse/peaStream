@@ -1,0 +1,29 @@
+[package]
+name = "fbaudio-core"
+version = "0.1.0"
+edition = "2021"
+description = "Lấy và phát âm thanh Facebook Live (audio-only) với độ trễ thấp"
+
+[features]
+default = []
+# Giải mã HE-AAC ĐẦY ĐỦ (SBR + PS) bằng FDK-AAC. Cần trình biên dịch C++ (MSVC / NDK / gcc) để dựng
+# mã nguồn FDK đi kèm crate `fdk-aac-sys`. Không bật: HE-AAC vẫn phát được nhưng chỉ phần lõi.
+sbr = ["dep:fdk-aac"]
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+# HTTP/1.1 đồng bộ + rustls (không cần OpenSSL → dễ biên dịch cho Android). Chỉ dùng để đọc luồng từ máy chủ yt-dlp.
+ureq = "2"
+# Giải mã AAC-LC thuần Rust
+symphonia = { version = "0.5", default-features = false, features = ["aac"] }
+# Xuất âm thanh: WASAPI (Windows) / Oboe-AAudio (Android) / ALSA...
+cpal = "0.15"
+ringbuf = "0.4"
+# Chỉ khi bật feature `sbr`
+fdk-aac = { version = "0.8", optional = true }
+
+# Diệt cả nhóm tiến trình của yt-dlp khi huỷ / hết giờ (chỉ Unix, gồm Android)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
