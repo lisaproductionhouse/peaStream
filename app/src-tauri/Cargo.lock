@@ -885,6 +885,7 @@ name = "fbaudio"
 version = "0.1.0"
 dependencies = [
  "fbaudio-core",
+ "log",
  "serde",
  "tauri",
  "tauri-build",

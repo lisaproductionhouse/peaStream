@@ -240,6 +240,7 @@
       <input id="yta" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
              placeholder="--cookies C:\cookies.txt">
     </div>
+    <p class="hint" id="logPath"></p>
   </details>
 </main>
 
@@ -251,7 +252,7 @@
     app: $('main'), url: $('#url'), paste: $('#paste'), play: $('#play'), level: $('#level'),
     state: $('#state'), sub: $('#sub'), modeHint: $('#modeHint'),
     buf: $('#buf'), under: $('#under'), kbps: $('#kbps'), hint: $('#hint'), note: $('#note'),
-    srv: $('#srv'), tok: $('#tok'), ytp: $('#ytp'), yta: $('#yta'), pathRow: $('#pathRow'), replay: $('#replay'),
+    srv: $('#srv'), tok: $('#tok'), ytp: $('#ytp'), yta: $('#yta'), pathRow: $('#pathRow'), replay: $('#replay'), logPath: $('#logPath'),
     modes: [...document.querySelectorAll('[data-mode]')],
   };
   const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
@@ -321,7 +322,9 @@
       el.level.style.strokeDashoffset = '';
     }
     el.hint.textContent = s === 'error' ? HINT_ERROR : defaultHint;
-    el.note.textContent = s === 'playing' && st.note ? st.note : '';
+    // cách đang lấy luồng + đệm đích (tự nới khi mạng giật), rồi ghi chú chất lượng nếu có
+    const how = st.mode ? `${st.mode} · đệm đích ${((st.reserve_ms || 0) / 1000).toFixed(1)} s` : '';
+    el.note.textContent = s === 'playing' ? [how, st.note || ''].filter(Boolean).join(' — ') : '';
     el.buf.textContent = s === 'playing' ? `${st.buffer_ms} ms` : '–';
     el.under.textContent = String(st.underruns || 0);
     el.kbps.textContent = st.bitrate_kbps ? `${st.bitrate_kbps} kbps` : '–';
@@ -405,6 +408,7 @@
     el[id].value = store.get(key, '');
     el[id].addEventListener('input', () => store.set(key, el[id].value));
   });
+  if (invoke) invoke('log_path').then((p) => { el.logPath.textContent = 'Nhật ký (gửi tệp này khi báo lỗi): ' + p; }).catch(() => {});
   el.replay.checked = store.get('replay', '') === '1';
   el.replay.addEventListener('change', () => {
     store.set('replay', el.replay.checked ? '1' : '');

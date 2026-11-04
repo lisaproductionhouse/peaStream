@@ -29,6 +29,7 @@ Tham số yt-dlp phải khớp với core/src/source.rs (hàm ytdlp_args); lý d
 import argparse
 import collections
 import hmac
+import json
 import os
 import re
 import shlex
@@ -62,7 +63,11 @@ def ytdlp_cmd(path):
 
 def ytdlp_args(cfg, url, ffmpeg):
     a = ["-f", "ba", "-o", "-", "--no-playlist", "--no-warnings", "--ignore-config", "--no-mtime",
-         "--socket-timeout", "15", "--print", "before_dl:FBAUDIO_TITLE=%(title)s"]
+         "--socket-timeout", "15",
+         # tiêu đề dạng JSON thuần ASCII: yt-dlp.exe trên Windows ghi stderr bằng bảng mã ANSI và bỏ ký tự không biểu diễn được
+         "--print", "before_dl:FBAUDIO_TITLE=%(title)j"]
+    if not ffmpeg:
+        a += ["--concurrent-fragments", "4"]  # khớp core/src/source.rs
     if ffmpeg:
         # extractor Facebook chụp manifest XML nhúng trong trang và không đặt is_live nên bộ tải gốc chỉ tải các đoạn
         # có sẵn rồi thoát: thử ép ffmpeg cho DASH (ffmpeg được đưa URL manifest, nếu trang có, và tự bám theo)
@@ -120,8 +125,11 @@ class Job:
         for raw in self.proc.stderr:
             line = clean(raw.decode("utf-8", "replace"))
             if line.startswith("FBAUDIO_TITLE="):
-                t = line.split("=", 1)[1].strip()
-                self.title = None if t in ("", "NA") else t
+                try:
+                    t = json.loads(line.split("=", 1)[1].strip())
+                except ValueError:
+                    t = None
+                self.title = t if isinstance(t, str) and t else None
             elif line.strip():
                 self.tail.append(line)
 

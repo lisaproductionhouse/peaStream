@@ -21,6 +21,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 fbaudio-core = { path = "../../core" }
+log = "0.4"
 
 # Giải mã AAC + resample cần mã đã tối ưu. Nếu để opt-level=0, bản `--debug` (APK ký debug, cài
 # thẳng được) sẽ chạy chậm và tốn pin trên điện thoại.

@@ -315,7 +315,9 @@ fn spawn(program: &OsStr, pre: &[&str], args: &[String], name: &'static str, own
                 let s = strip_ansi(&String::from_utf8_lossy(&line));
                 let s = s.trim_end();
                 if let Some(v) = s.strip_prefix("FBAUDIO_TITLE=") {
-                    info.set_title(v.trim());
+                    if let Some(t) = parse_json_string(v) {
+                        info.set_title(&t);
+                    }
                 } else if !s.trim().is_empty() {
                     let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
                     t.push_back(s.to_string());
@@ -383,12 +385,19 @@ fn ytdlp_args(cfg: &YtDlp, url: &str, ffmpeg: bool) -> Vec<String> {
         "-f", "ba", // chỉ luồng audio tốt nhất: không bao giờ tải video
         "-o", "-", // ghi dữ liệu ra stdout
         "--no-playlist", "--no-warnings", "--ignore-config", "--no-mtime", "--socket-timeout", "15",
-        // tiêu đề: khi `-o -` yt-dlp dẫn `--print` ra stderr nên stdout vẫn chỉ là dữ liệu
-        "--print", "before_dl:FBAUDIO_TITLE=%(title)s",
+        // Tiêu đề: khi `-o -` yt-dlp dẫn `--print` ra stderr nên stdout vẫn chỉ là dữ liệu. Dạng `j` = chuỗi JSON thuần
+        // ASCII (`\uXXXX`): `yt-dlp.exe` trên Windows bỏ qua PYTHONUTF8/PYTHONIOENCODING, ghi stderr bằng bảng mã ANSI và
+        // BỎ HẲN ký tự không biểu diễn được (ă, ệ, ậ…), còn á, à… thành byte đơn → `�`. Dạng văn bản thường không an toàn.
+        "--print", "before_dl:FBAUDIO_TITLE=%(title)j",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if !ffmpeg {
+        // Bộ tải gốc: tải vài đoạn song song (đã kiểm: khi ghi ra stdout cho ĐÚNG từng byte như tải tuần tự). Mỗi lượt chạy lại
+        // phải tải cả cửa sổ nên thời gian tải từng đoạn nối tiếp là phần đáng kể của chu kỳ lượt trên mạng thật (chưa đo).
+        a.extend(["--concurrent-fragments", "4"].map(String::from));
+    }
     if ffmpeg {
         // Với Facebook, extractor phân tích bản manifest XML NHÚNG trong trang (một ảnh chụp tại lúc tải trang) và
         // không đặt `is_live`: bộ tải gốc chỉ tải đúng các đoạn trong ảnh chụp đó (đã gặp: 11 đoạn) rồi thoát.
@@ -591,6 +600,51 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Giải mã một chuỗi JSON (`"..."`, kể cả `\uXXXX` và cặp thay thế). `null` hoặc không hợp lệ → `None`.
+fn parse_json_string(s: &str) -> Option<String> {
+    let inner = s.trim().strip_prefix('"')?.strip_suffix('"')?;
+    let hex4 = |it: &mut std::str::Chars<'_>| -> Option<u32> {
+        let h: String = it.by_ref().take(4).collect();
+        if h.len() == 4 { u32::from_str_radix(&h, 16).ok() } else { None }
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut it = inner.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let hi = hex4(&mut it)?;
+                if (0xD800..0xDC00).contains(&hi) {
+                    // cặp thay thế (ký tự ngoài BMP, ví dụ emoji): phải theo sau bằng \uDC00..DFFF
+                    if it.next()? != '\\' || it.next()? != 'u' {
+                        return None;
+                    }
+                    let lo = hex4(&mut it)?;
+                    if !(0xDC00..0xE000).contains(&lo) {
+                        return None;
+                    }
+                    out.push(char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))?);
+                } else {
+                    out.push(char::from_u32(hi)?);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// Tách tham số kiểu shell đơn giản: khoảng trắng phân cách, nháy đơn/kép gom nhóm.
 pub fn split_args(s: &str) -> Vec<String> {
     let (mut out, mut cur, mut quote, mut any) = (Vec::new(), String::new(), None, false);
@@ -666,6 +720,20 @@ mod tests {
     }
 
     #[test]
+    fn title_json_survives_any_console_codepage_and_handles_escapes() {
+        // yt-dlp.exe trên Windows in tiêu đề dạng JSON thuần ASCII nên không bao giờ vỡ dấu
+        assert_eq!(
+            parse_json_string(r#""Kh\u0103n voan l\u00e0 full hi\u1ec7u Nh\u1eadt m\u1edbi""#).as_deref(),
+            Some("Khăn voan là full hiệu Nhật mới")
+        );
+        assert_eq!(parse_json_string(r#""\ud83d\ude00 \"q\" \\ a\/b\n""#).as_deref(), Some("😀 \"q\" \\ a/b\n"));
+        assert_eq!(parse_json_string("  \"x\"  ").as_deref(), Some("x"));
+        for bad in ["null", "", "abc", r#""\ud83d""#, r#""\ud83dx""#, r#""\u12""#, r#""\q""#] {
+            assert_eq!(parse_json_string(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn error_line_prefers_ytdlp_error_and_trims_boilerplate() {
         let t: VecDeque<String> = [
             "WARNING: x",
@@ -695,6 +763,7 @@ mod tests {
         // phát lại: bộ tải gốc, không cần ffmpeg
         let r = ytdlp_args(&cfg, "https://fb.watch/x", false);
         assert!(!r.iter().any(|x| x.contains("ffmpeg") || x == "--downloader"), "phát lại không được phụ thuộc ffmpeg: {r:?}");
+        assert!(r.windows(2).any(|w| w == ["--concurrent-fragments", "4"]), "bộ tải gốc tải song song vài đoạn");
         assert_eq!(&r[r.len() - 2..], ["--", "https://fb.watch/x"]);
     }
 }

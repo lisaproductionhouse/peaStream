@@ -5,6 +5,8 @@
 #
 # Cần: yt-dlp (PATH hoặc FBAUDIO_YTDLP), ffmpeg, python3 + numpy, cargo.
 # Dùng:  scripts/e2e-pipe.sh [giây_đoạn]      (mặc định 2)
+# Dùng plugin mô phỏng Facebook:  URL_PATH=fb/live YTDLP_ARGS="--plugin-dirs $PWD/scripts/fblike-plugin"
+#   (FBLIKE_DELAY / FBLIKE_JITTER / FBLIKE_SEED làm mỗi lượt trích xuất chậm và dao động như trang thật, xem fblike.py)
 # Biến môi trường:  WINDOW=11  số đoạn trong cửa sổ manifest (mặc định 60; Facebook thật: ~11)
 #                   FBAUDIO_NO_FFMPEG=1  đi thẳng bộ tải gốc (mô phỏng trang không có URL manifest dùng được)
 #                   VIA_HELPER=1  chạy qua scripts/ytdlp_helper.py (đường dành cho Android) thay vì yt-dlp tại chỗ
@@ -21,6 +23,7 @@ YT="${FBAUDIO_YTDLP:-$(command -v yt-dlp || true)}"
 cleanup() { kill ${HTTP_PID:-} ${FF_PID:-} ${HELPER_PID:-} 2>/dev/null || true; }
 trap cleanup EXIT
 
+rm -f "${FBLIKE_STATE:-/tmp/fblike.state}"
 python3 "$ROOT/scripts/alias_server.py" "$DIR" "$PORT" "$DIR/requests.log" & HTTP_PID=$!
 FF_START=$(date +%s.%N)
 # video được map TRƯỚC (Representation 0 = video, 1 = audio): thứ tự mà ffmpeg/yt-dlp mong đợi
@@ -42,7 +45,9 @@ else
   SRC=(--ytdlp "$YT" ${YTDLP_ARGS:+--ytdlp-args "$YTDLP_ARGS"})
 fi
 "$ROOT/target/debug/fbaudio" "http://127.0.0.1:$PORT/$URL_PATH" "${SRC[@]}" --no-update --wav "$DIR/out.wav" --secs "${RUN_SECS:-26}" ${CLI_FLAGS:-} -v 2>&1 \
-  | tee "$DIR/app.log" | grep -E "luồng|loại|đuổi|Error|Không|HE-AAC" | sed 's/^/  fbaudio: /' || true
+  | tee "$DIR/app.log" | grep -E "luồng|loại|đuổi|nới|thu hẹp|lượt xong|Error|Không|HE-AAC" | sed 's/^/  fbaudio: /' || true
 V=$(grep -c "chunk-0-" "$DIR/requests.log" || true); A=$(grep -c "chunk-1-.* 200" "$DIR/requests.log" || true)
 echo "  yêu cầu tới máy chủ nguồn: audio(200)=$A  video=$V (gồm init)   ← video phải rất ít / bằng 0"
 python3 "$ROOT/scripts/analyze_wav.py" "$DIR" "$FF_START"
+LAST=$(grep -E "(Playing|Connecting)" "$DIR/app.log" | tail -1 | sed 's/^ *//')
+echo "  trạng thái cuối: $LAST"

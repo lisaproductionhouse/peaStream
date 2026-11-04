@@ -141,47 +141,81 @@ fn track_info(profile: u8, idx: u8, ch: u8) -> TrackInfo {
 
 // ------------------------------------------------------------------------------------- lọc lặp
 
-/// Loại các access unit bị phát lặp.
+/// Loại các access unit bị phát LẶP lại (cả dải).
 ///
-/// Demuxer DASH live của ffmpeg (đã quan sát trên 6.1.1) đôi khi phát RA HAI LẦN mỗi đoạn live. Một AU bị
-/// coi là lặp khi nó giống hệt một AU trước đó mà:
-///  * cách đây 16..16384 AU (đoạn lặp cách nhau cả chục AU; thấp hơn là khung giống nhau liên tiếp),
-///  * mới xuất hiện đúng một lần (khung im lặng CBR giống hệt nhau xuất hiện rất nhiều lần nên không bao giờ bị loại),
-///  * dài ≥ 64 byte (khung ngắn quá dễ trùng).
+/// Demuxer DASH live của ffmpeg phát lặp đoạn live; mức độ lặp thay đổi theo nhịp mạng (đã đo: nguồn êm thì mỗi đoạn hai
+/// lần, nguồn giật thì ba lần trở lên). Cách "AU đã thấy đúng một lần thì lần hai là bản lặp" bỏ sót từ bản thứ ba.
+///
+/// Cách làm: bản lặp luôn đến thành DẢI liên tiếp, đúng thứ tự, trùng một dải đã thấy trước đó. Một AU là bản lặp khi nó
+/// trùng một AU cũ (cách ≥ 16 AU, dài ≥ 64 byte) VÀ AU liền trước hoặc liền sau nó cũng trùng AU liền kề tương ứng của dải cũ
+/// đó. Nhờ yêu cầu "căn thẳng với hàng xóm":
+///  * khung im lặng CBR giống hệt nhau (cách nhau 1 AU, hoặc dưới 64 byte) không bao giờ bị loại;
+///  * một AU trùng ngẫu nhiên đứng một mình không bị loại;
+///  * cả AU đầu và AU cuối của dải lặp đều bị loại (nhìn trước một AU, trễ thêm ~23 ms).
 pub struct Dedupe {
-    seen: HashMap<u64, (u32, u64)>, // hash → (số lần, chỉ số AU gần nhất)
-    order: VecDeque<(u64, u64)>,    // (chỉ số, hash) để quên dần
+    last: HashMap<u64, u64>,     // hash → chỉ số lần xuất hiện gần nhất
+    order: VecDeque<(u64, u64)>, // (chỉ số, hash) để quên dần
     idx: u64,
+    pending: Option<Pending>,
+    prev_j: Option<u64>,
     pub dropped: u64,
+}
+
+struct Pending {
+    au: Vec<u8>,
+    /// Chỉ số lần xuất hiện cũ (đủ xa) của AU này, nếu có.
+    j: Option<u64>,
+    /// AU liền trước cũng là bản lặp và căn thẳng với AU này.
+    aligned_prev: bool,
 }
 
 impl Dedupe {
     pub fn new() -> Self {
-        Self { seen: HashMap::new(), order: VecDeque::new(), idx: 0, dropped: 0 }
+        Self { last: HashMap::new(), order: VecDeque::new(), idx: 0, pending: None, prev_j: None, dropped: 0 }
     }
 
-    pub fn is_dup(&mut self, au: &[u8]) -> bool {
+    /// Nhận một AU; trả về AU ĐÃ ĐƯỢC QUYẾT ĐỊNH là giữ của lượt trước (trễ một AU), hoặc `None`.
+    pub fn push(&mut self, au: &[u8]) -> Option<Vec<u8>> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         au.hash(&mut h);
         let h = h.finish();
         let i = self.idx;
         self.idx += 1;
-        let prev = self.seen.get(&h).copied();
-        let e = self.seen.entry(h).or_insert((0, i));
-        e.0 += 1;
-        e.1 = i;
+        let j = self.last.get(&h).copied().filter(|&a| i - a >= 16 && au.len() >= 64);
+        self.last.insert(h, i);
         self.order.push_back((i, h));
-        while self.order.front().is_some_and(|(j, _)| i - *j > 16_384) {
-            let (j, hh) = self.order.pop_front().unwrap();
-            if self.seen.get(&hh).is_some_and(|e| e.1 == j) {
-                self.seen.remove(&hh);
+        while self.order.front().is_some_and(|(k, _)| i - *k > 16_384) {
+            let (k, hh) = self.order.pop_front().unwrap();
+            if self.last.get(&hh).is_some_and(|&l| l == k) {
+                self.last.remove(&hh);
             }
         }
-        let dup = au.len() >= 64 && matches!(prev, Some((1, p)) if (16..=16_384).contains(&(i - p)));
-        if dup {
-            self.dropped += 1;
+        // quyết định cho AU đang chờ: lặp nếu căn thẳng với AU liền trước HOẶC với AU này
+        let mut out = None;
+        if let Some(p) = self.pending.take() {
+            let aligned_next = matches!((p.j, j), (Some(a), Some(b)) if b == a + 1);
+            if p.aligned_prev || aligned_next {
+                self.dropped += 1;
+            } else {
+                out = Some(p.au);
+            }
         }
-        dup
+        let aligned_prev = matches!((self.prev_j, j), (Some(a), Some(b)) if b == a + 1);
+        self.pending = Some(Pending { au: au.to_vec(), j, aligned_prev });
+        self.prev_j = j;
+        out
+    }
+
+    /// Hết luồng: quyết định nốt AU đang chờ (chỉ còn nhìn được hàng xóm phía trước).
+    pub fn flush(&mut self) -> Option<Vec<u8>> {
+        let p = self.pending.take()?;
+        self.prev_j = None;
+        if p.aligned_prev {
+            self.dropped += 1;
+            None
+        } else {
+            Some(p.au)
+        }
     }
 }
 
@@ -336,40 +370,72 @@ mod tests {
         assert!(Demux::new().feed(&[1, 2, 3], &mut |_| Ok(())).is_ok());
     }
 
+    /// Chạy một chuỗi AU qua bộ lọc (kèm nhả nốt ở cuối) và trả về các AU được giữ.
+    fn dedupe_run(aus: &[Vec<u8>]) -> (Vec<Vec<u8>>, u64) {
+        let mut d = Dedupe::new();
+        let mut kept: Vec<Vec<u8>> = aus.iter().filter_map(|a| d.push(a)).collect();
+        kept.extend(d.flush());
+        (kept, d.dropped)
+    }
+
+    fn au(n: u32) -> Vec<u8> {
+        (0..100u32).map(|k| (n.wrapping_mul(2654435761).wrapping_add(k * 97) >> 5) as u8).collect()
+    }
+
     #[test]
-    fn dedupe_drops_replayed_segments_but_keeps_silence_and_real_audio() {
-        let au = |n: u32| -> Vec<u8> {
-            (0..100u32).map(|k| (n.wrapping_mul(2654435761).wrapping_add(k * 97) >> 5) as u8).collect()
-        };
-        // 3 đoạn 40 AU; mỗi đoạn live được phát ra HAI lần, đúng kiểu ffmpeg
-        let mut stream: Vec<Vec<u8>> = Vec::new();
-        for seg in 0..3u32 {
+    fn dedupe_drops_replayed_runs_of_any_multiplicity_and_keeps_silence_and_real_audio() {
+        // mẫu cũ: mỗi đoạn live phát HAI lần (A B | B C | C D …) → mỗi AU chỉ còn đúng một bản
+        let mut stream = Vec::new();
+        for seg in 0..4u32 {
             for _ in 0..2 {
                 stream.extend((0..40).map(|k| au(seg * 40 + k)));
             }
         }
-        let mut d = Dedupe::new();
-        let kept: Vec<_> = stream.iter().filter(|a| !d.is_dup(a)).collect();
-        assert_eq!(kept.len(), 120, "phải còn đúng 3×40 AU, mất {} bản lặp", stream.len() - kept.len());
-        assert_eq!(d.dropped, 120);
+        let (kept, _) = dedupe_run(&stream);
+        let expect: Vec<_> = (0..160).map(au).collect();
+        assert!(kept == expect, "hai lần: còn {} AU, cần đúng 160 theo thứ tự", kept.len());
+
+        // nguồn giật: BA lần trở lên (đã đo: cách "đúng một lần" bỏ sót từ bản thứ ba)
+        let mut stream = Vec::new();
+        for seg in 0..3u32 {
+            for _ in 0..4 {
+                stream.extend((0..40).map(|k| au(seg * 40 + k)));
+            }
+        }
+        let (kept, dropped) = dedupe_run(&stream);
+        assert!(kept == (0..120).map(au).collect::<Vec<_>>(), "bốn lần: còn {} AU, cần đúng 120", kept.len());
+        assert_eq!(dropped, 360);
+
+        // phát lại một dải CŨ sau khi đã có nội dung mới hơn (đúng chuỗi lỗi đã nghe: 38 39 40 41 | 38 39 42 43 | 40 41 44 45)
+        let seq: Vec<u32> = [38, 39, 40, 41, 38, 39, 42, 43, 40, 41, 44, 45]
+            .iter()
+            .flat_map(|m| (0..43).map(move |k| m * 100 + k))
+            .collect();
+        let (kept, _) = dedupe_run(&seq.iter().map(|&n| au(n)).collect::<Vec<_>>());
+        let want: Vec<_> = [38u32, 39, 40, 41, 42, 43, 44, 45].iter().flat_map(|m| (0..43).map(move |k| au(m * 100 + k))).collect();
+        assert!(kept == want, "dải phát lại phải bị loại cả AU đầu lẫn cuối: còn {} AU, cần {}", kept.len(), want.len());
 
         // im lặng CBR: hàng trăm AU giống hệt (kể cả sau một đoạn tiếng nói) không được bị coi là lặp
         let silence = vec![0u8; 278];
-        let mut d = Dedupe::new();
-        let mut dropped = 0;
+        let mut stream = Vec::new();
         for round in 0..5 {
-            for _ in 0..200 {
-                dropped += d.is_dup(&silence) as u32;
-            }
-            for k in 0..60 {
-                dropped += d.is_dup(&au(10_000 + round * 100 + k)) as u32;
-            }
+            stream.extend(std::iter::repeat(silence.clone()).take(200));
+            stream.extend((0..60).map(|k| au(10_000 + round * 100 + k)));
         }
-        assert!(dropped <= 1, "không được loại khung im lặng: loại {dropped}");
+        let (kept, _) = dedupe_run(&stream);
+        assert_eq!(kept.len(), stream.len(), "không được loại khung im lặng hay âm thanh thật");
 
-        // âm thanh thật không lặp thì giữ nguyên toàn bộ
-        let mut d = Dedupe::new();
-        assert!((0..2000).all(|k| !d.is_dup(&au(50_000 + k))));
+        // một AU trùng ngẫu nhiên đứng một mình (không có hàng xóm căn thẳng) không bị loại
+        let mut stream: Vec<_> = (0..100).map(au).collect();
+        stream.push(au(5)); // trùng AU số 5 nhưng AU trước/sau nó không trùng tương ứng
+        stream.extend((200..260).map(au));
+        let (kept, _) = dedupe_run(&stream);
+        assert_eq!(kept.len(), stream.len(), "AU trùng đứng một mình phải được giữ");
+
+        // âm thanh thật không lặp thì giữ nguyên toàn bộ, đúng thứ tự
+        let all: Vec<_> = (0..2000).map(|k| au(50_000 + k)).collect();
+        let (kept, dropped) = dedupe_run(&all);
+        assert!(kept == all && dropped == 0);
     }
 
     #[test]

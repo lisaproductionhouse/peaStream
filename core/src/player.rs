@@ -11,6 +11,7 @@ use crate::output::{Meter, Output, SinkKind, Tuning};
 use crate::source::{self, looks_like_extractor_break, Killer, NotInstalled, Opened, Source};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -88,6 +89,10 @@ pub struct Status {
     pub received_kb: u64,
     /// Ghi chú về chất lượng âm thanh (ví dụ HE-AAC chỉ phát phần lõi).
     pub note: Option<String>,
+    /// Đang lấy luồng bằng cách nào: "ffmpeg (bám live)", "chạy lại từng lượt (~5,8 s/lượt)", "phát lại".
+    pub mode: String,
+    /// Đệm đích hiện tại (ms): mức cài sẵn cộng phần tự nới sau các lần cạn.
+    pub reserve_ms: u32,
 }
 
 impl Status {
@@ -102,6 +107,8 @@ impl Status {
             codec: String::new(),
             received_kb: 0,
             note: None,
+            mode: String::new(),
+            reserve_ms: 0,
         }
     }
 }
@@ -178,6 +185,7 @@ impl Player {
             let rate = m.rate.load(Relaxed).max(1) as u64;
             s.buffer_ms = (m.fill_frames.load(Relaxed) as u64 * 1000 / rate) as u32;
             s.underruns = m.underruns.load(Relaxed);
+            s.reserve_ms = m.reserve_ms.load(Relaxed);
         }
         s
     }
@@ -335,6 +343,8 @@ struct Session {
     /// Chỉ có với luồng live.
     gate: Option<Gate>,
     playing_ever: bool,
+    /// Trung bình trượt thời gian một lượt chạy công cụ (ms), 0 nếu chưa đo.
+    cycle_ms: f64,
     core_rate: u32,
     total: u64,
     au_bytes: u64,
@@ -349,6 +359,7 @@ impl Session {
             dec: None,
             gate: live.then(Gate::new),
             playing_ever: false,
+            cycle_ms: 0.0,
             core_rate: 48_000,
             total: 0,
             au_bytes: 0,
@@ -385,6 +396,13 @@ fn run(sh: &Shared, cfg: &PlayerConfig) -> Result<()> {
     let (mut updated, mut idle_runs, mut idle_since) = (false, 0u32, None::<Instant>);
     loop {
         let started = Instant::now();
+        sh.update(|s| {
+            s.mode = match (cfg.live, strategy) {
+                (false, _) => "phát lại".into(),
+                (true, Strategy::Ffmpeg) => "ffmpeg (bám live)".into(),
+                (true, Strategy::Native) => "chạy lại từng lượt".into(),
+            }
+        });
         if !sess.playing_ever {
             sh.set(State::Resolving, waiting_message(&cfg.source));
         }
@@ -409,8 +427,13 @@ fn run(sh: &Shared, cfg: &PlayerConfig) -> Result<()> {
             opened.killer.kill(); // bấm Dừng ngay lúc đang mở
             return Ok(());
         }
+        if cfg.live && strategy == Strategy::Native {
+            out.set_burst_mode(true); // bộ tải gốc chắc chắn thoát sau mỗi lượt: dữ liệu về theo cục ngay từ lượt đầu
+        }
         let limit = if strategy == Strategy::Ffmpeg { FFMPEG_FIRST_BYTE_LIMIT_MS } else { FIRST_BYTE_LIMIT_MS };
-        let outcome = match pump(sh, opened, &mut out, &mut sess, limit) {
+        // bộ tải gốc chắc chắn sẽ thoát: chờ EOF để nhả đuôi, đừng tin vào khoảng im lặng
+        let join = if strategy == Strategy::Ffmpeg { Join::Continuous } else { Join::Bounded };
+        let outcome = match pump(sh, opened, &mut out, &mut sess, limit, join) {
             Ok(o) => o,
             // cách 1 hỏng trước khi có tiếng đầu tiên (treo, định dạng lạ, lỗi đọc…) → lùi về cách 2
             Err(e) if strategy == Strategy::Ffmpeg && !sess.playing_ever && !sh.stopped() => {
@@ -458,6 +481,11 @@ fn run(sh: &Shared, cfg: &PlayerConfig) -> Result<()> {
 
         // Live mà công cụ đã thoát: hoặc yt-dlp chỉ tải cửa sổ hữu hạn (chạy lại và nối tiếp), hoặc phiên live đã hết.
         out.set_burst_mode(true);
+        let run_ms = started.elapsed().as_secs_f64() * 1000.0;
+        sess.cycle_ms = if sess.cycle_ms == 0.0 { run_ms } else { 0.7 * sess.cycle_ms + 0.3 * run_ms };
+        let cycle = sess.cycle_ms;
+        sh.update(|s| s.mode = format!("chạy lại từng lượt (~{:.1} s/lượt)", cycle / 1000.0));
+        log::info!("lượt xong sau {:.1} s: {new_aus} AU mới; chu kỳ trung bình {:.1} s", run_ms / 1000.0, cycle / 1000.0);
         if new_aus == 0 || err.is_some() {
             idle_runs += 1;
             idle_since.get_or_insert_with(Instant::now);
@@ -472,7 +500,7 @@ fn run(sh: &Shared, cfg: &PlayerConfig) -> Result<()> {
             }
             return Ok(());
         }
-        log::debug!("lượt xong: {new_aus} AU mới, lỗi {err:?} → chạy lại");
+        log::debug!("lỗi của lượt: {err:?}");
         while started.elapsed() < MIN_RUN_INTERVAL {
             if sh.stopped() {
                 return Ok(());
@@ -554,16 +582,43 @@ fn spawn_reader(mut stream: Box<dyn source::Stream>) -> std::sync::mpsc::Receive
     rx
 }
 
+/// Đưa PCM vừa giải mã qua cổng (nếu là live) rồi vào bộ đệm phát.
+fn deliver(sh: &Shared, out: &mut Output, sess: &mut Session, pcm: &mut Vec<f32>) {
+    if pcm.is_empty() {
+        return;
+    }
+    let (rate, ch) = sess.dec.as_ref().map_or((48_000, 2), |d| (d.rate, d.channels));
+    let ms = pcm.len() as f64 / ch.max(1) as f64 / rate.max(1) as f64 * 1000.0;
+    let to_push: Option<(Vec<f32>, u32, usize)> = match sess.gate.as_mut() {
+        None => Some((std::mem::take(pcm), rate, ch)),
+        Some(g) => match g.feed(Instant::now(), ms, pcm, rate, ch) {
+            Verdict::Push => Some((std::mem::take(pcm), rate, ch)),
+            Verdict::Keep => None,
+            Verdict::Release => g.take(),
+        },
+    };
+    match to_push {
+        Some((p, r, c)) => {
+            out.push(&p, r, c);
+            mark_playing(sh, sess);
+        }
+        None if !sess.playing_ever => sh.set(State::Connecting, "Đang bỏ qua phần lịch sử để vào live"),
+        None => {}
+    }
+    pcm.clear();
+}
+
 /// Một lượt chạy của công cụ: đọc tới hết luồng, đưa âm thanh mới vào `out`.
-fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first_byte_limit_ms: u64) -> Result<Outcome> {
+fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first_byte_limit_ms: u64, join: Join) -> Result<Outcome> {
     let Opened { stream, info, killer } = opened;
     let mon = Monitor::start(killer, first_byte_limit_ms);
     let rx = spawn_reader(stream);
     sess.stitch.begin_run();
     if let Some(g) = sess.gate.as_mut() {
-        g.begin_run();
+        g.begin_run(join);
     }
 
+    let run_started = Instant::now();
     let mut demux = Demux::new();
     let mut pcm: Vec<f32> = Vec::new();
     let mut last_report = Instant::now();
@@ -591,7 +646,7 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // công cụ đang im lặng: nếu một đợt giao vừa kết thúc thì nhả phần đang giữ / phần đuôi
-                let released = sess.gate.as_mut().and_then(|g| g.tick(Instant::now()).and_then(|r| g.take(r)));
+                let released = sess.gate.as_mut().and_then(|g| if g.tick(Instant::now()) { g.take() } else { None });
                 if let Some((p, rate, ch)) = released {
                     out.push(&p, rate, ch);
                     mark_playing(sh, sess);
@@ -629,57 +684,24 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
                     }
                 }
                 Ev::Frame(f) => {
-                    // bỏ phần chồng lấn với lượt trước, rồi bỏ bản lặp ngay trong luồng (ffmpeg phát lặp đoạn live)
-                    if !sess.stitch.accept(f) || sess.dedupe.is_dup(f) {
+                    // bỏ phần chồng lấn với lượt trước, rồi bỏ bản lặp ngay trong luồng (ffmpeg phát lặp đoạn live);
+                    // bộ lọc lặp nhìn trước một AU nên trả về AU của lượt trước
+                    if !sess.stitch.accept(f) {
                         return Ok(());
                     }
-                    sess.au_bytes += f.len() as u64;
-                    sess.au_frames += 1;
-                    if let Some(d) = sess.dec.as_mut() {
-                        d.decode(f, &mut pcm)?;
+                    if let Some(ready) = sess.dedupe.push(f) {
+                        sess.au_bytes += ready.len() as u64;
+                        sess.au_frames += 1;
+                        if let Some(d) = sess.dec.as_mut() {
+                            d.decode(&ready, &mut pcm)?;
+                        }
                     }
                 }
             }
             Ok(())
         })?;
 
-        if !pcm.is_empty() {
-            let (rate, ch) = sess.dec.as_ref().map_or((48_000, 2), |d| (d.rate, d.channels));
-            let ms = pcm.len() as f64 / ch.max(1) as f64 / rate.max(1) as f64 * 1000.0;
-            let verdict = match sess.gate.as_mut() {
-                Some(g) => g.feed(Instant::now(), ms),
-                None => Verdict::PushAll,
-            };
-            match verdict {
-                Verdict::PushAll => {
-                    if let Some((p, r, c)) = sess.gate.as_mut().and_then(|g| g.take(Release::Held)) {
-                        out.push(&p, r, c);
-                    }
-                    out.push(&pcm, rate, ch);
-                    mark_playing(sh, sess);
-                }
-                Verdict::Hold => {
-                    if let Some(g) = sess.gate.as_mut() {
-                        g.hold(&pcm, rate, ch);
-                    }
-                }
-                Verdict::DiscardAll => {
-                    if let Some(g) = sess.gate.as_mut() {
-                        g.flood(&pcm, rate, ch);
-                    }
-                    if !sess.playing_ever {
-                        sh.set(State::Connecting, "Đang bỏ qua phần lịch sử để vào live");
-                    }
-                    log::debug!("đang dồn lịch sử: bỏ im lặng tới khi về sát live");
-                }
-                Verdict::Discard => {
-                    if let Some(g) = sess.gate.as_mut() {
-                        g.skip(&pcm, rate, ch);
-                    }
-                }
-            }
-            pcm.clear();
-        }
+        deliver(sh, out, sess, &mut pcm);
         if last_report.elapsed() >= Duration::from_secs(1) {
             last_report = Instant::now();
             report(sh, &info, sess);
@@ -693,7 +715,19 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
         bail!("{m}");
     }
     // hết luồng: nhả phần đang giữ (luồng ngắn) hoặc phần đuôi của đợt dồn (cửa sổ hữu hạn): đó là nội dung mới nhất có
-    let released = sess.gate.as_mut().and_then(|g| g.finish().and_then(|r| g.take(r)));
+    // AU cuối cùng còn nằm trong bộ lọc lặp (nó nhìn trước một AU): giải mã nốt
+    if let Some(ready) = sess.dedupe.flush() {
+        sess.au_bytes += ready.len() as u64;
+        sess.au_frames += 1;
+        if let Some(d) = sess.dec.as_mut() {
+            d.decode(&ready, &mut pcm)?;
+        }
+        deliver(sh, out, sess, &mut pcm);
+    }
+    // Phần đuôi dài bằng MỘT CHU KỲ lượt (tối thiểu 2,5 s): lượt kế tiếp chỉ về sau chừng đó, nên đuôi ngắn hơn thì đệm cạn
+    // trước khi dữ liệu mới tới (đo: đuôi 2,5 s với lượt ~6 s gây khe 3,7 s ngay giây thứ 7).
+    let cycle_tail_ms = (run_started.elapsed().as_secs_f64() * 1200.0).clamp(GATE_TAIL_MS, GATE_TAIL_MAX_MS);
+    let released = sess.gate.as_mut().and_then(|g| if g.finish(cycle_tail_ms) { g.take() } else { None });
     if let Some((p, rate, ch)) = released {
         out.push(&p, rate, ch);
         mark_playing(sh, sess);
@@ -706,137 +740,119 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
     Ok(Outcome::Ran { new_aus: sess.stitch.new_aus, err })
 }
 
-// ---------------------------------------------------------------- cổng bỏ phần dồn lúc vào live
+// ---------------------------------------------------------------- cổng bỏ lịch sử lúc vào live
 
-/// Im lặng ngần này (giữa hai lần dữ liệu về) = một "đợt giao" đã kết thúc: công cụ đang chờ dữ liệu live mới.
-const GATE_IDLE: Duration = Duration::from_millis(150);
-/// Lúc bắt đầu: âm thanh về nhiều hơn thời gian thực chừng này (ms) trong cùng một đợt giao → đang dồn lịch sử.
-const GATE_START_SURPLUS_MS: f64 = 4_500.0;
-/// Về sau: chỉ các đợt dồn rất lớn (sau khi mạng nghẽn dài) mới bị bỏ hẳn; mức vừa phải do `Output` tự cắt.
-const GATE_BURST_SURPLUS_MS: f64 = 12_000.0;
+/// Cửa sổ đo tốc độ âm thanh về. Đủ dài để dao động của mạng (mỗi đoạn tải mất 0,1–1,5 s) không làm một đợt đổ lịch sử trông
+/// giống live: đo trên nguồn giật, cửa sổ 3 s với ngưỡng 1,5× nhầm lịch sử là live ngay giữa các đoạn.
+const GATE_RATE_WINDOW: Duration = Duration::from_secs(5);
+/// Quan sát tối thiểu trước khi dám kết luận "đang live".
+const GATE_MIN_OBS: Duration = Duration::from_secs(4);
+/// Âm thanh về dưới ngưỡng này (lần thời gian thực, đo trong cửa sổ) = đã tới mép live; lịch sử đổ ra thì ≥ 2×.
+const GATE_LIVE_RATE: f64 = 1.6;
+
+/// Phần đuôi nhớ lại: nội dung MỚI NHẤT có được, phát ngay khi biết đã tới mép live (hoặc khi công cụ thoát).
+/// Mặc định 2,5 s; khi công cụ thoát (lượt chạy lại) thì dài bằng một chu kỳ lượt, tối đa `GATE_TAIL_MAX_MS` (cũng là lượng
+/// đuôi được nhớ).
+const GATE_TAIL_MS: f64 = 2_500.0;
+const GATE_TAIL_MAX_MS: f64 = 12_000.0;
 
 #[derive(Debug, PartialEq)]
 enum Verdict {
-    /// Phát (nhả cả phần đang giữ trước).
-    PushAll,
-    /// Giữ lại, chưa biết có phải dồn lịch sử không (chỉ ở đợt giao đầu tiên).
-    Hold,
-    /// Bỏ phần này (nhưng nhớ phần đuôi).
-    Discard,
-    /// Đang dồn lịch sử: bỏ phần này và cả phần đang giữ (nhưng nhớ phần đuôi).
-    DiscardAll,
+    /// Đã vào live: phát phần này luôn.
+    Push,
+    /// Chưa biết/đang dồn lịch sử: cổng giữ lại (chỉ nhớ phần đuôi).
+    Keep,
+    /// Vừa xác định đã tới mép live: phát `Gate::take()` (đã gồm cả phần này).
+    Release,
 }
 
-/// Cái gì được nhả ra khỏi cổng.
-#[derive(Debug, PartialEq, Clone, Copy)]
-enum Release {
-    Held,
-    Tail,
+/// Cách công cụ giao dữ liệu, quyết định cách nhận ra "đã vào live".
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Join {
+    /// Luồng không dừng (ffmpeg bám live): nhận ra mép live bằng tốc độ âm thanh về.
+    Continuous,
+    /// Công cụ chắc chắn sẽ thoát (bộ tải gốc): lượt ĐẦU luôn giữ tới EOF rồi phát phần đuôi; từ lượt sau mọi thứ đều là mới.
+    Bounded,
 }
 
-/// Phần đuôi nhớ lại của một đợt dồn: nội dung MỚI NHẤT có được, phát ngay khi đợt dồn kết thúc.
-const GATE_TAIL_MS: f64 = 2_500.0;
-
-/// Vào live giữa chừng một luồng có lịch sử (cửa sổ DVR), công cụ như yt-dlp có thể đổ cả lịch sử ra nhanh gấp nhiều
-/// lần thời gian thực. Nếu phát hết thì nghe thấy vài giây âm thanh CŨ rồi cắt vụn. Cổng này ở đợt giao đầu tiên giữ
-/// PCM lại đợi đợt giao kết thúc: kết thúc sớm (≤ vài giây dư) = luồng thật sự đang live → phát; còn tiếp tục đổ
-/// dồn → bỏ im lặng nhưng NHỚ phần đuôi (2,5 s cuối), và phát phần đuôi đó khi đợt dồn dừng (luồng chững lại ở mép live
-/// hoặc công cụ thoát). Không bỏ trắng hoàn toàn: phần đuôi của cửa sổ hữu hạn chính là nội dung mới nhất hiện có.
+/// Vào live giữa chừng một luồng có lịch sử (cửa sổ DVR), công cụ có thể đổ cả lịch sử ra nhanh gấp nhiều lần thời gian thực.
+/// Phát hết thì nghe âm thanh CŨ rồi cắt vụn. Cổng giữ PCM lại (chỉ nhớ phần đuôi mới nhất) cho tới khi biết đã tới mép live.
+///
+/// Cố ý KHÔNG dùng "khoảng im lặng giữa hai lần dữ liệu về" làm dấu hiệu: trên mạng thật mỗi đoạn lịch sử tải mất vài trăm ms
+/// nên giữa các đoạn lịch sử nào cũng có khoảng im lặng (đã đo: cổng tưởng là live, phát đoạn cũ nhất trước rồi bộ đệm cắt vụn).
 struct Gate {
-    decided: bool,
-    closed: bool,
-    started: bool,
-    last: Option<Instant>,
-    ep_start: Instant,
-    ep_media: f64,
-    held: Vec<f32>,
-    held_fmt: (u32, usize),
+    joined: bool,
+    join: Join,
+    t_first: Option<Instant>,
+    /// (lúc về, ms âm thanh) trong `GATE_RATE_WINDOW` gần nhất.
+    events: VecDeque<(Instant, f64)>,
     tail: Vec<f32>,
     tail_fmt: (u32, usize),
+    /// Chỉ nhả chừng này (ms) cuối của đuôi.
+    tail_keep_ms: f64,
 }
 
 impl Gate {
     fn new() -> Self {
         Gate {
-            decided: false,
-            closed: false,
-            started: false,
-            last: None,
-            ep_start: Instant::now(),
-            ep_media: 0.0,
-            held: Vec::new(),
-            held_fmt: (48_000, 2),
+            joined: false,
+            join: Join::Continuous,
+            t_first: None,
+            events: VecDeque::new(),
             tail: Vec::new(),
             tail_fmt: (48_000, 2),
+            tail_keep_ms: GATE_TAIL_MS,
         }
     }
 
-    /// Một lượt chạy mới của công cụ bắt đầu: coi như đợt giao mới.
-    fn begin_run(&mut self) {
-        self.last = None;
-        self.ep_media = 0.0;
-        self.closed = false;
+    /// Một lượt chạy mới của công cụ.
+    fn begin_run(&mut self, join: Join) {
+        self.join = join;
+        self.t_first = None;
+        self.events.clear();
         self.tail.clear();
+        self.tail_keep_ms = GATE_TAIL_MS;
     }
 
-    /// Có `ms` âm thanh (đã giải mã, đã lọc lặp) vừa về lúc `now`.
-    fn feed(&mut self, now: Instant, ms: f64) -> Verdict {
-        let new_episode = self.last.map_or(true, |l| now.duration_since(l) >= GATE_IDLE);
-        self.last = Some(now);
-        if new_episode {
-            // đợt giao trước (nếu có) đã kết thúc mà chưa vượt ngưỡng → đó là live thật
-            if !self.decided && self.started {
-                self.decided = true;
-            }
-            self.ep_start = now;
-            self.ep_media = 0.0;
-            self.closed = false;
+    /// Có `ms` âm thanh (`pcm`, đã giải mã và lọc lặp) vừa về lúc `now`.
+    fn feed(&mut self, now: Instant, ms: f64, pcm: &[f32], rate: u32, ch: usize) -> Verdict {
+        if self.joined {
+            return Verdict::Push;
         }
-        self.started = true;
-        self.ep_media += ms;
-        let surplus = self.ep_media - now.duration_since(self.ep_start).as_secs_f64() * 1000.0;
-        if !self.decided {
-            if surplus > GATE_START_SURPLUS_MS {
-                self.decided = true;
-                self.closed = true;
-                return Verdict::DiscardAll;
-            }
-            return Verdict::Hold;
+        self.keep_tail(pcm, rate, ch);
+        if self.join == Join::Bounded {
+            return Verdict::Keep; // chờ EOF
         }
-        if surplus > GATE_BURST_SURPLUS_MS {
-            self.closed = true;
-        }
-        if self.closed {
-            Verdict::Discard
+        self.t_first.get_or_insert(now);
+        self.events.push_back((now, ms));
+        if self.live_now(now) {
+            self.joined = true;
+            Verdict::Release
         } else {
-            Verdict::PushAll
+            Verdict::Keep
         }
     }
 
-    fn hold(&mut self, pcm: &[f32], rate: u32, ch: usize) {
-        self.held_fmt = (rate, ch);
-        self.held.extend_from_slice(pcm);
-    }
-
-    /// Phát hiện đang dồn lịch sử: phần đang giữ trở thành đuôi (cũ hơn `pcm`), rồi nối `pcm` vào.
-    fn flood(&mut self, pcm: &[f32], rate: u32, ch: usize) {
-        self.tail.clear();
-        self.tail_fmt = (rate, ch);
-        let held = std::mem::take(&mut self.held);
-        self.keep_tail(&held, rate, ch);
-        self.keep_tail(pcm, rate, ch);
-    }
-
-    /// Bỏ `pcm` nhưng nhớ phần đuôi (chỉ giữ GATE_TAIL_MS cuối).
-    fn skip(&mut self, pcm: &[f32], rate: u32, ch: usize) {
-        self.keep_tail(pcm, rate, ch);
+    /// Tốc độ âm thanh về trong cửa sổ gần nhất đã xuống mức live chưa.
+    fn live_now(&mut self, now: Instant) -> bool {
+        while self.events.front().is_some_and(|(t, _)| now.duration_since(*t) > GATE_RATE_WINDOW) {
+            self.events.pop_front();
+        }
+        let Some(t0) = self.t_first else { return false };
+        let elapsed = now.duration_since(t0);
+        if elapsed < GATE_MIN_OBS {
+            return false;
+        }
+        let win = GATE_RATE_WINDOW.min(elapsed).as_secs_f64();
+        let media: f64 = self.events.iter().map(|(_, m)| m).sum();
+        media / 1000.0 / win < GATE_LIVE_RATE
     }
 
     fn keep_tail(&mut self, pcm: &[f32], rate: u32, ch: usize) {
         self.tail_fmt = (rate, ch);
         self.tail.extend_from_slice(pcm);
         let ch = ch.max(1);
-        let max = (rate as f64 * ch as f64 * GATE_TAIL_MS / 1000.0) as usize / ch * ch;
+        let max = (rate as f64 * ch as f64 * GATE_TAIL_MAX_MS / 1000.0) as usize / ch * ch;
         if self.tail.len() > max {
             // cắt theo bội của số kênh để không đảo kênh trái/phải
             let cut = (self.tail.len() - max).div_ceil(ch) * ch;
@@ -844,42 +860,38 @@ impl Gate {
         }
     }
 
-    /// Gọi định kỳ khi không có dữ liệu mới. `Some` = một đợt giao vừa kết thúc → nhả phần tương ứng.
-    fn tick(&mut self, now: Instant) -> Option<Release> {
-        let idle = self.started && self.last.is_some_and(|l| now.duration_since(l) >= GATE_IDLE);
-        if !idle {
-            return None;
+    /// Gọi định kỳ khi không có dữ liệu mới: tốc độ về tụt xuống khi luồng chững lại ở mép live. `true` = vừa vào live.
+    fn tick(&mut self, now: Instant) -> bool {
+        if self.joined || self.join == Join::Bounded || self.t_first.is_none() {
+            return false;
         }
-        if !self.decided {
-            self.decided = true;
-            return Some(Release::Held);
+        if self.live_now(now) {
+            self.joined = true;
+            return true;
         }
-        if self.closed {
-            self.closed = false;
-            return Some(Release::Tail);
-        }
-        None
+        false
     }
 
-    /// Hết luồng (công cụ thoát): nhả phần còn lại.
-    fn finish(&mut self) -> Option<Release> {
-        self.decided = true;
-        if self.closed {
-            self.closed = false;
-            Some(Release::Tail)
-        } else if !self.held.is_empty() {
-            Some(Release::Held)
-        } else {
-            None
+    /// Hết luồng (công cụ thoát): nếu chưa vào live thì phát phần đuôi (dài `tail_ms`). `true` = có gì để phát.
+    fn finish(&mut self, tail_ms: f64) -> bool {
+        if self.joined {
+            return false;
         }
+        self.joined = true;
+        self.tail_keep_ms = tail_ms;
+        !self.tail.is_empty()
     }
 
-    fn take(&mut self, r: Release) -> Option<(Vec<f32>, u32, usize)> {
-        let (buf, fmt) = match r {
-            Release::Held => (&mut self.held, self.held_fmt),
-            Release::Tail => (&mut self.tail, self.tail_fmt),
-        };
-        (!buf.is_empty()).then(|| (std::mem::take(buf), fmt.0, fmt.1))
+    /// Lấy phần đang giữ (chỉ `tail_keep_ms` cuối, cắt theo bội của số kênh).
+    fn take(&mut self) -> Option<(Vec<f32>, u32, usize)> {
+        let (rate, ch) = self.tail_fmt;
+        let ch = ch.max(1);
+        let keep = (rate as f64 * ch as f64 * self.tail_keep_ms / 1000.0) as usize / ch * ch;
+        if self.tail.len() > keep {
+            let cut = self.tail.len() - keep;
+            self.tail.drain(..cut);
+        }
+        (!self.tail.is_empty()).then(|| (std::mem::take(&mut self.tail), rate, ch))
     }
 }
 
@@ -891,125 +903,120 @@ mod gate_tests {
         t0 + Duration::from_millis(ms)
     }
 
+    /// Đẩy một đoạn `secs` giây mang giá trị `v` (rate 1000, mono: 1 mẫu = 1 ms) vào cổng.
+    fn seg(g: &mut Gate, t0: Instant, t_ms: u64, secs: f64, v: f32) -> Verdict {
+        g.feed(at(t0, t_ms), secs * 1000.0, &vec![v; (secs * 1000.0) as usize], 1000, 1)
+    }
+
     #[test]
-    fn realtime_stream_with_2s_bursts_is_released_after_idle_and_never_discarded() {
+    fn realtime_2s_segments_join_after_the_minimum_observation_then_everything_is_pushed() {
         let t0 = Instant::now();
         let mut g = Gate::new();
-        // đoạn đầu 2 s về trong 40 ms (3 lần đọc), rồi im
-        assert_eq!(g.feed(at(t0, 0), 700.0), Verdict::Hold);
-        assert_eq!(g.feed(at(t0, 20), 700.0), Verdict::Hold);
-        assert_eq!(g.feed(at(t0, 40), 600.0), Verdict::Hold);
-        assert!(g.tick(at(t0, 100)).is_none(), "chưa đủ im lặng");
-        assert_eq!(g.tick(at(t0, 200)), Some(Release::Held), "im ≥150 ms → nhả phần đang giữ");
-        assert!(g.tick(at(t0, 250)).is_none(), "chỉ nhả một lần");
-        // các đợt sau: phát ngay, kể cả đợt 4 s
-        for k in 1..6u64 {
-            assert_eq!(g.feed(at(t0, 2000 * k), 1000.0), Verdict::PushAll);
-            assert_eq!(g.feed(at(t0, 2000 * k + 30), 1000.0), Verdict::PushAll);
+        assert_eq!(seg(&mut g, t0, 0, 2.0, 0.0), Verdict::Keep);
+        assert!(!g.tick(at(t0, 3_000)), "chưa đủ thời gian quan sát");
+        assert_eq!(seg(&mut g, t0, 2_000, 2.0, 1.0), Verdict::Keep);
+        // tới 4 s: 2 đoạn trong 4 s = 1× → live; phát đuôi mới nhất
+        assert_eq!(seg(&mut g, t0, 4_000, 2.0, 2.0), Verdict::Release);
+        let (tail, rate, ch) = g.take().unwrap();
+        assert_eq!((tail.len(), rate, ch), (2_500, 1000, 1));
+        assert_eq!(*tail.last().unwrap(), 2.0);
+        for k in 3..8 {
+            assert_eq!(seg(&mut g, t0, k * 2_000, 2.0, k as f32), Verdict::Push);
         }
     }
 
+    /// Đoạn dài 4 s: ngay sau đoạn thứ hai, cửa sổ 5 s còn chứa cả hai đoạn (8 s/4 s = 2×) nên chưa kết luận; khi đoạn cũ trượt
+    /// khỏi cửa sổ (qua `tick`, ~5,1 s) thì tốc độ về còn 1× → vào live, và đuôi kết thúc bằng đoạn thứ hai.
     #[test]
-    fn history_flood_is_discarded_silently_then_live_resumes_after_the_first_idle() {
+    fn four_second_segments_join_once_the_older_one_leaves_the_window() {
         let t0 = Instant::now();
         let mut g = Gate::new();
-        // lịch sử 48 s đổ ra ở tốc độ 8×: mỗi 100 ms về 800 ms âm thanh
-        let mut verdicts = Vec::new();
-        for i in 0..60u64 {
-            verdicts.push(g.feed(at(t0, i * 100), 800.0));
+        assert_eq!(seg(&mut g, t0, 0, 4.0, 0.0), Verdict::Keep);
+        assert!(!g.tick(at(t0, 3_900)));
+        assert_eq!(seg(&mut g, t0, 4_000, 4.0, 1.0), Verdict::Keep);
+        assert!(!g.tick(at(t0, 4_900)), "đoạn đầu (4,9 s tuổi) còn trong cửa sổ 5 s");
+        assert!(g.tick(at(t0, 5_100)), "đoạn đầu đã trượt khỏi cửa sổ: tốc độ về = 1×");
+        let (tail, _, _) = g.take().unwrap();
+        assert_eq!(*tail.last().unwrap(), 1.0);
+        assert_eq!(seg(&mut g, t0, 8_000, 4.0, 2.0), Verdict::Push);
+    }
+
+    /// Đúng lỗi đã gặp: lịch sử đổ về với độ trễ mạng giữa các đoạn (mỗi đoạn 2 s âm thanh về cách nhau 0,4 s). Khoảng im lặng
+    /// giữa các đoạn KHÔNG được coi là live; chỉ khi luồng chững lại ở mép live (mỗi 2 s một đoạn) mới vào live, và phần
+    /// đuôi phải là âm thanh MỚI NHẤT (không phải đoạn cổ nhất của lịch sử).
+    #[test]
+    fn flood_with_network_latency_is_not_mistaken_for_live_and_the_tail_is_the_newest_audio() {
+        let t0 = Instant::now();
+        let mut g = Gate::new();
+        let mut t = 0u64;
+        for k in 0..20u64 {
+            assert_eq!(seg(&mut g, t0, t, 2.0, k as f32), Verdict::Keep, "đoạn lịch sử {k} ở {t} ms");
+            assert!(!g.tick(at(t0, t + 300)), "khoảng im lặng 300 ms giữa các đoạn lịch sử không phải live");
+            t += 400;
         }
-        assert!(verdicts[..5].iter().all(|v| *v == Verdict::Hold), "vài lần đầu còn giữ: {verdicts:?}");
-        assert_eq!(verdicts.iter().filter(|v| **v == Verdict::DiscardAll).count(), 1);
-        assert!(verdicts.iter().skip(8).all(|v| *v == Verdict::Discard), "sau đó bỏ hết: {verdicts:?}");
-        // lịch sử hết, luồng chững lại ở mép live (đợt kế tiếp sau 1,9 s im lặng) → phát lại
-        assert_eq!(g.feed(at(t0, 5900 + 1900), 2000.0), Verdict::PushAll);
-        assert_eq!(g.feed(at(t0, 5900 + 1900 + 20), 2000.0), Verdict::PushAll);
-    }
-
-    #[test]
-    fn a_huge_burst_after_startup_is_dropped_but_moderate_ones_are_kept() {
-        let t0 = Instant::now();
-        let mut g = Gate::new();
-        assert_eq!(g.feed(at(t0, 0), 2000.0), Verdict::Hold);
-        assert_eq!(g.tick(at(t0, 300)), Some(Release::Held));
-        // đợt dồn vừa phải sau khi mạng chậm (6 s về cùng lúc): giữ, để Output tự cắt
-        assert_eq!(g.feed(at(t0, 5000), 3000.0), Verdict::PushAll);
-        assert_eq!(g.feed(at(t0, 5010), 3000.0), Verdict::PushAll);
-        // đợt khổng lồ (30 s ào về): từ khi vượt ngưỡng thì bỏ hết phần còn lại của đợt
-        let mut t = 20_000;
-        let mut dropped = 0;
-        for _ in 0..12 {
-            if g.feed(at(t0, t), 3000.0) == Verdict::Discard {
-                dropped += 1;
-            }
-            t += 10;
-        }
-        assert!(dropped >= 6, "phải bỏ phần lớn đợt khổng lồ, bỏ {dropped}");
-    }
-
-    #[test]
-    fn short_stream_finishing_inside_the_hold_is_not_lost() {
-        let t0 = Instant::now();
-        let mut g = Gate::new();
-        assert_eq!(g.feed(at(t0, 0), 1500.0), Verdict::Hold);
-        g.hold(&[0.5; 8], 1000, 2);
-        // luồng kết thúc trước khi tick: phần đang giữ phải được nhả
-        assert_eq!(g.finish(), Some(Release::Held));
-        assert_eq!(g.take(Release::Held).map(|(p, r, c)| (p.len(), r, c)), Some((8, 1000, 2)));
-    }
-
-    /// Cửa sổ hữu hạn (yt-dlp tải 11 đoạn rồi thoát): toàn bộ lượt đầu là "dồn". Không được bỏ trắng: phải phát phần
-    /// ĐUÔI, vì đó là nội dung mới nhất hiện có.
-    #[test]
-    fn flood_keeps_only_the_newest_tail_and_releases_it_when_the_tool_exits_or_goes_idle() {
-        let t0 = Instant::now();
-        let mut g = Gate::new();
-        // 1 mẫu = 1 ms (rate 1000, mono); mỗi lần về 800 mẫu mang giá trị = chỉ số lần
-        let mut i = 0u64;
-        loop {
-            let pcm = vec![i as f32; 800];
-            match g.feed(at(t0, i * 20), 800.0) {
-                Verdict::Hold => g.hold(&pcm, 1000, 1),
-                Verdict::DiscardAll => {
-                    g.flood(&pcm, 1000, 1);
+        // lịch sử hết; từ đây mỗi 2 s một đoạn live (giá trị 100, 101, …)
+        let mut joined_at = None;
+        for k in 0..6u64 {
+            t += 2_000;
+            match seg(&mut g, t0, t, 2.0, 100.0 + k as f32) {
+                Verdict::Release => {
+                    joined_at = Some(t);
                     break;
                 }
+                Verdict::Keep => {}
                 v => panic!("{v:?}"),
             }
-            i += 1;
         }
-        for k in 1..30u64 {
-            let pcm = vec![(i + k) as f32; 800];
-            assert_eq!(g.feed(at(t0, (i + k) * 20), 800.0), Verdict::Discard);
-            g.skip(&pcm, 1000, 1);
-        }
-        // đợt dồn dừng: nhả đúng 2500 mẫu cuối, mẫu cuối là của lần về cuối cùng
-        let last_t = (i + 29) * 20;
-        assert!(g.tick(at(t0, last_t + 50)).is_none());
-        assert_eq!(g.tick(at(t0, last_t + 200)), Some(Release::Tail));
-        let (tail, rate, ch) = g.take(Release::Tail).unwrap();
-        assert_eq!((tail.len(), rate, ch), (2500, 1000, 1));
-        assert_eq!(*tail.last().unwrap(), (i + 29) as f32);
-        // sau đó cổng mở lại: đợt sau phát bình thường
-        assert_eq!(g.feed(at(t0, last_t + 2000), 1000.0), Verdict::PushAll);
+        let t_join = joined_at.expect("phải vào live sau khi luồng chững lại");
+        let (tail, _, _) = g.take().unwrap();
+        assert!(*tail.last().unwrap() >= 100.0, "đuôi phải kết thúc bằng âm thanh live, không phải lịch sử");
+        assert!(tail.iter().all(|v| *v >= 18.0), "đuôi không được chứa đoạn cổ của lịch sử: {:?}", &tail[..3]);
+        assert!(t_join <= 7_600 + 12_000, "vào live quá muộn: {t_join} ms");
     }
 
     #[test]
-    fn tail_is_cut_on_a_channel_boundary_and_a_new_run_resets_the_gate() {
+    fn bounded_tool_holds_the_first_run_until_eof_and_the_tail_covers_one_cycle() {
         let t0 = Instant::now();
         let mut g = Gate::new();
-        assert_eq!(g.feed(at(t0, 0), 800.0), Verdict::Hold);
-        // 2 kênh: mẫu chẵn là L, mẫu lẻ là R; tối đa 5000 mẫu (2,5 s)
-        g.flood(&(0..5000).map(|k| k as f32).collect::<Vec<_>>(), 1000, 2);
-        g.skip(&[7.0; 4], 1000, 2); // 2 khung nữa → phải cắt 4 mẫu đầu, không được cắt lẻ làm đảo kênh
-        let (tail, _, _) = g.take(Release::Tail).unwrap();
-        assert_eq!(tail.len(), 5000);
-        assert_eq!(tail[0], 4.0, "đuôi phải bắt đầu ở mẫu kênh trái (chẵn), không bị lệch cặp L/R");
-        assert_eq!(&tail[4996..], &[7.0; 4]);
-        // lượt chạy mới: cổng đóng được mở lại, đuôi cũ bị bỏ
-        g.closed = true;
-        g.begin_run();
-        assert!(!g.closed && g.take(Release::Tail).is_none());
+        g.begin_run(Join::Bounded);
+        for k in 0..40u64 {
+            assert_eq!(seg(&mut g, t0, k * 50, 2.0, k as f32), Verdict::Keep);
+        }
+        // dù im lặng bao lâu cũng không tự nhả (tiến trình thoát trễ sau byte cuối)
+        assert!(!g.tick(at(t0, 60_000)));
+        // EOF: đuôi dài bằng một chu kỳ lượt (7 s)
+        assert!(g.finish(7_000.0));
+        let (tail, _, _) = g.take().unwrap();
+        assert_eq!(tail.len(), 7_000);
+        assert_eq!(*tail.last().unwrap(), 39.0);
+        // lượt sau: mọi thứ đều là nội dung mới
+        g.begin_run(Join::Bounded);
+        assert_eq!(seg(&mut g, t0, 100_000, 3.0, 50.0), Verdict::Push);
+    }
+
+    #[test]
+    fn short_stream_ending_before_it_joined_still_plays_what_it_has() {
+        let t0 = Instant::now();
+        let mut g = Gate::new();
+        assert_eq!(seg(&mut g, t0, 0, 1.5, 7.0), Verdict::Keep);
+        assert!(g.finish(GATE_TAIL_MS), "luồng ngắn kết thúc trước khi vào live: vẫn phải phát");
+        assert_eq!(g.take().map(|(p, r, c)| (p.len(), r, c)), Some((1_500, 1000, 1)));
+    }
+
+    #[test]
+    fn tail_is_cut_on_a_channel_boundary() {
+        let t0 = Instant::now();
+        let mut g = Gate::new();
+        g.begin_run(Join::Bounded);
+        // 2 kênh: mẫu chẵn là L, mẫu lẻ là R; đuôi tối đa 12 s = 24000 mẫu
+        let pcm: Vec<f32> = (0..30_000).map(|k| k as f32).collect();
+        assert_eq!(g.feed(at(t0, 0), 15_000.0, &pcm, 1000, 2), Verdict::Keep);
+        g.feed(at(t0, 10), 2.0, &[7.0; 4], 1000, 2); // 2 khung nữa
+        assert!(g.finish(2_500.0));
+        let (tail, _, _) = g.take().unwrap();
+        assert_eq!(tail.len(), 5_000);
+        assert_eq!(tail[0] % 2.0, 0.0, "đuôi phải bắt đầu ở mẫu kênh trái (chẵn), không lệch cặp L/R");
+        assert_eq!(&tail[4_996..], &[7.0; 4]);
     }
 }
 
@@ -1063,7 +1070,7 @@ mod tests {
     #[test]
     fn vod_through_fake_ytdlp_plays_in_full_with_title_and_codec() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let f = fake("vod", r#"echo "FBAUDIO_TITLE=Phiên thử nghiệm" >&2; cat "$D/audio.adts""#);
+        let f = fake("vod", r#"printf '%s\n' 'FBAUDIO_TITLE="Phi\u00ean th\u1eed nghi\u1ec7m"' >&2; cat "$D/audio.adts""#);
         let (st, secs) = play(&f, false);
         assert_eq!(st.state, State::Ended, "{}", st.message);
         assert!((2.0..2.6).contains(&secs), "WAV dài {secs:.2} s, cần ≈ 2 s (nội dung đã kết thúc phải phát đủ)");
@@ -1131,9 +1138,11 @@ f="$D/w$n.adts"; [ -f "$f" ] || f="$D/w3.adts"; cat "$f""#,
         let (st, secs) = play_live(&f, false);
         assert_eq!(st.state, State::Ended, "{}", st.message);
         let expect = 260.0 * 1024.0 / 44_100.0; // 6,04 s
+        // WAV tính theo đồng hồ thật nên có thêm khoảng lặng của đệm sàn chế độ theo đợt (Siêu thấp: 1,0 s) và khe giữa
+        // các lượt; nếu phần chồng lấn bị phát lặp thì sẽ ≥ 10 s
         assert!(
-            (expect - 0.3..expect + 1.2).contains(&secs),
-            "WAV dài {secs:.2} s, cần ≈ {expect:.2} s (≥ 8 s nghĩa là phần chồng lấn bị phát lặp)"
+            (expect - 0.3..expect + 2.5).contains(&secs),
+            "WAV dài {secs:.2} s, cần ≈ {expect:.2} s + đệm sàn (≥ 10 s nghĩa là phần chồng lấn bị phát lặp)"
         );
         let runs: u32 = std::fs::read_to_string(f.dir.join("n")).unwrap().trim().parse().unwrap();
         assert!(runs >= 4, "phải chạy lại nhiều lượt cho tới khi hết mới, chỉ chạy {runs}");
@@ -1159,7 +1168,8 @@ cat "$D/audio.adts""#,
             lines.len() >= 3 && lines[1..].iter().all(|l| !l.contains("dash:ffmpeg")),
             "các lượt sau phải dùng bộ tải gốc: {lines:?}"
         );
-        assert!((2.0..2.9).contains(&secs), "âm thanh không được nhân đôi hay mất: {secs:.2} s");
+        // 2 s âm thanh + đệm sàn 1,0 s của chế độ theo đợt; nếu nhân đôi thì ≥ 5 s
+        assert!((2.0..4.4).contains(&secs), "âm thanh không được nhân đôi hay mất: {secs:.2} s");
     }
 
     /// ffmpeg TREO (không lỗi, không ra byte nào: ví dụ chờ URL manifest không dùng được) → người gác diệt nó sớm và app

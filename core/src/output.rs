@@ -23,11 +23,21 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const RING_SECONDS: usize = 12;
-/// Cửa sổ tìm đáy mức đệm: đủ dài để chứa ít nhất một chu kỳ giao dữ liệu (đoạn DASH ~2 s).
-const LOW_WINDOW: Duration = Duration::from_secs(3);
+const RING_SECONDS: usize = 30;
+/// Cửa sổ tìm đáy mức đệm. Phải đủ dài để một lần dữ liệu về dồn sau một đoạn trễ KHÔNG bị coi là "dư kéo dài" và bị cắt
+/// ngay. Đo (nguồn giật: mỗi đoạn trễ thêm 0–1,5 s, mức Cân bằng): cửa sổ 3 s cắt hàng đợi về mức đệm sau mỗi lần phục hồi
+/// nên lần trễ kế tiếp lại cạn: 7 lần ngắt/80 s; cửa sổ 12 s: 4 lần.
+const LOW_WINDOW: Duration = Duration::from_secs(12);
 /// Vòng đệm chứa quá chừng này thì chắc chắn đang bị dồn (backlog): cắt cứng, giữ lại đúng `margin`.
 const BACKLOG_CAP_MS: f64 = 9_000.0;
+/// Riêng chế độ theo đợt (dữ liệu về từng lượt lớn): một đợt vài giây cộng đệm dự phòng là chuyện bình thường.
+const BACKLOG_CAP_BURST_MS: f64 = 24_000.0;
+
+/// Chế độ theo đợt: dữ liệu vốn về thành CỤC (mỗi lượt công cụ một cục, thời gian lượt dao động vài giây) nên cần đệm sàn
+/// lớn hơn luồng liên tục. Theo mức người dùng chọn (đệm cài sẵn 120/350/900 ms → sàn 1,0/2,0/4,0 s).
+fn burst_floor_ms(margin_ms: f64) -> f64 {
+    (margin_ms * 5.7).clamp(1_000.0, 4_500.0)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Tuning {
@@ -51,6 +61,8 @@ pub struct Meter {
     pub underruns: AtomicU32,
     pub started: AtomicBool,
     pub rate: AtomicU32,
+    /// Đệm đích hiện tại (ms): mức cài sẵn, hoặc đệm sàn ở chế độ theo đợt.
+    pub reserve_ms: AtomicU32,
 }
 
 struct Callback {
@@ -190,6 +202,16 @@ impl Output {
     }
 
     /// Đẩy PCM float xen kẽ kênh (từ bộ giải mã) vào hàng đợi phát.
+    /// Đệm đích hiện tại (ms): mức cài sẵn; chế độ theo đợt có thêm đệm sàn.
+    pub fn reserve_ms(&self) -> f64 {
+        let base = self.tuning.margin_ms as f64;
+        if self.burst_mode {
+            base.max(burst_floor_ms(base))
+        } else {
+            base
+        }
+    }
+
     pub fn push(&mut self, pcm: &[f32], src_rate: u32, src_ch: usize) {
         if pcm.is_empty() || src_ch == 0 || src_rate == 0 {
             return;
@@ -215,7 +237,8 @@ impl Output {
 
         let dev = self.dev_rate as f64;
         let ms = |frames: usize| frames as f64 * 1000.0 / dev;
-        let margin_ms = self.tuning.margin_ms as f64;
+        let margin_ms = self.reserve_ms();
+        self.meter.reserve_ms.store(margin_ms as u32, Relaxed);
         let slack_ms = if self.burst_mode { (self.tuning.slack_ms as f64).max(8_000.0) } else { self.tuning.slack_ms as f64 };
 
         if !self.live {
@@ -271,7 +294,8 @@ impl Output {
         // 6) tụt quá xa live → bỏ phần cũ nhất. Đáy cao hơn mong muốn quá `slack` nghĩa là lúc nào cũng có chừng đó
         //    âm thanh nằm chờ vô ích. Ngoài ra chặn cứng để vòng đệm không tràn khi dữ liệu dồn một lúc.
         let mut start = 0usize;
-        let drop = if ms(fill) + ms(inc) > BACKLOG_CAP_MS {
+        let cap_ms = if self.burst_mode { BACKLOG_CAP_BURST_MS } else { BACKLOG_CAP_MS };
+        let drop = if ms(fill) + ms(inc) > cap_ms {
             ((ms(fill) + ms(inc) - margin_ms) * dev / 1000.0) as usize
         } else if low > margin_ms + slack_ms {
             ((low - margin_ms) * dev / 1000.0) as usize
@@ -568,5 +592,17 @@ mod tests {
         for i in 0..out.len() / 2 {
             assert!((out[2 * i] - input[2 * i]).abs() < 1e-5, "khung {i}");
         }
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    #[test]
+    fn burst_floor_scales_with_the_preset_the_user_chose() {
+        assert_eq!(burst_floor_ms(120.0), 1_000.0); // Siêu thấp
+        assert!((burst_floor_ms(350.0) - 2_000.0).abs() < 10.0); // Cân bằng
+        assert_eq!(burst_floor_ms(900.0), 4_500.0); // Ổn định
     }
 }
