@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const RING_SECONDS: usize = 30;
+const RING_SECONDS: usize = 90;
 /// Cửa sổ tìm đáy mức đệm. Phải đủ dài để một lần dữ liệu về dồn sau một đoạn trễ KHÔNG bị coi là "dư kéo dài" và bị cắt
 /// ngay. Đo (nguồn giật: mỗi đoạn trễ thêm 0–1,5 s, mức Cân bằng): cửa sổ 3 s cắt hàng đợi về mức đệm sau mỗi lần phục hồi
 /// nên lần trễ kế tiếp lại cạn: 7 lần ngắt/80 s; cửa sổ 12 s: 4 lần.
@@ -31,11 +31,11 @@ const LOW_WINDOW: Duration = Duration::from_secs(12);
 /// Vòng đệm chứa quá chừng này thì chắc chắn đang bị dồn (backlog): cắt cứng, giữ lại đúng `margin`.
 const BACKLOG_CAP_MS: f64 = 9_000.0;
 /// Riêng chế độ theo đợt (dữ liệu về từng lượt lớn): một đợt vài giây cộng đệm dự phòng là chuyện bình thường.
-const BACKLOG_CAP_BURST_MS: f64 = 24_000.0;
+const BACKLOG_CAP_BURST_MS: f64 = 80_000.0;
 
 /// Chế độ theo đợt: dữ liệu vốn về thành CỤC (mỗi lượt công cụ một cục, thời gian lượt dao động vài giây) nên cần đệm sàn
 /// lớn hơn luồng liên tục. Theo mức người dùng chọn (đệm cài sẵn 120/350/900 ms → sàn 1,0/2,0/4,0 s).
-fn burst_floor_ms(margin_ms: f64) -> f64 {
+pub fn burst_floor_ms(margin_ms: f64) -> f64 {
     (margin_ms * 5.7).clamp(1_000.0, 4_500.0)
 }
 
@@ -117,6 +117,8 @@ pub struct Output {
     live: bool,
     /// Dữ liệu về theo từng lượt lớn (vài giây một lần, không đều): giữ liền mạch thay vì đuổi theo live.
     burst_mode: bool,
+    /// Đệm đích (đáy hàng đợi ngay trước khi cục mới về) ở chế độ theo đợt; do `begin_burst` cập nhật mỗi chu kỳ.
+    burst_target_ms: f64,
     // `Stream` không Send → Output phải sống trọn đời trong luồng player.
     _stream: Option<cpal::Stream>,
     sim: Option<JoinHandle<()>>,
@@ -183,6 +185,7 @@ impl Output {
             closing,
             stop,
             burst_mode: false,
+            burst_target_ms: 0.0,
             live: true,
             _stream: stream,
             sim,
@@ -198,7 +201,33 @@ impl Output {
     /// một lượt, nên ưu tiên liền mạch. Tắt điều tốc (phát nhanh cả lượt nghe lệch cao độ) và chỉ cắt khi đệm quá
     /// dày (> 8 s), thay vì cắt hễ đáy cao hơn `slack`.
     pub fn set_burst_mode(&mut self, on: bool) {
+        if on && !self.burst_mode {
+            self.burst_target_ms = burst_floor_ms(self.tuning.margin_ms as f64);
+        }
         self.burst_mode = on;
+    }
+
+    /// Chế độ theo đợt: gọi trước khi đẩy âm thanh đầu tiên của MỖI lượt. Hàng đợi chỉ giảm giữa hai lượt nên mức đệm lúc này
+    /// chính là "đáy" của chu kỳ vừa rồi. Đáy thấp hơn `target_ms` → phát chậm lại một chút để dựng lại đệm; cao hơn → phát
+    /// nhanh hơn để giảm độ trễ. Hệ là bộ tích phân (mỗi lượt dài `cycle_ms`, tốc độ v làm đệm đổi cycle·(v−1)) nên độ lợi 0,5 =
+    /// sai số giảm một nửa sau mỗi chu kỳ, không dao động. Giới hạn nhanh +6%, chậm −3% như chế độ liên tục.
+    ///
+    /// Không có lực kéo này thì đệm là một bước đi ngẫu nhiên (mỗi chu kỳ dài/ngắn hơn chu kỳ trước vài giây) với rào chắn ở 0:
+    /// cứ chạm 0 là ngắt, rồi lại vọt lên một cục (đã đo: đệm 0 ↔ 19 s, 2 lần ngắt ở hai chu kỳ đầu).
+    pub fn begin_burst(&mut self, target_ms: f64, cycle_ms: f64) {
+        self.burst_target_ms = target_ms.clamp(burst_floor_ms(self.tuning.margin_ms as f64), 40_000.0);
+        let fill = (self.prod.occupied_len() / 2).saturating_sub(self.skip.load(Relaxed));
+        let trough = fill as f64 * 1000.0 / self.dev_rate as f64;
+        self.speed = if self.meter.started.load(Relaxed) && trough >= 8.0 {
+            1.0 + (0.5 * (trough - self.burst_target_ms) / cycle_ms.max(4_000.0)).clamp(-0.03, 0.06)
+        } else {
+            1.0
+        };
+        log::info!(
+            "lượt mới: đáy {trough:.0} ms, đích {:.0} ms, chu kỳ {cycle_ms:.0} ms → tốc độ {:.3}",
+            self.burst_target_ms,
+            self.speed
+        );
     }
 
     /// Đẩy PCM float xen kẽ kênh (từ bộ giải mã) vào hàng đợi phát.
@@ -206,7 +235,7 @@ impl Output {
     pub fn reserve_ms(&self) -> f64 {
         let base = self.tuning.margin_ms as f64;
         if self.burst_mode {
-            base.max(burst_floor_ms(base))
+            self.burst_target_ms.max(burst_floor_ms(base))
         } else {
             base
         }
@@ -239,7 +268,10 @@ impl Output {
         let ms = |frames: usize| frames as f64 * 1000.0 / dev;
         let margin_ms = self.reserve_ms();
         self.meter.reserve_ms.store(margin_ms as u32, Relaxed);
-        let slack_ms = if self.burst_mode { (self.tuning.slack_ms as f64).max(8_000.0) } else { self.tuning.slack_ms as f64 };
+        // chế độ theo đợt: không cắt theo "đáy" (mất nội dung); chỉ có trần backlog cứng. Bộ điều khiển theo lượt lo độ trễ.
+        let slack_ms = if self.burst_mode { f64::INFINITY } else { self.tuning.slack_ms as f64 };
+        // khoảng lặng chèn khi (re)start: ở chế độ theo đợt không quá 3 s (phần đệm còn lại do điều tốc dựng dần)
+        let rebuffer_ms = if self.burst_mode { margin_ms.min(3_000.0) } else { margin_ms };
 
         if !self.live {
             // VOD: tốc độ 1,0, không đuổi live; chỉ dựng đệm lúc khởi động rồi chặn nguồn theo nhịp phát.
@@ -258,7 +290,7 @@ impl Output {
         let pending_skip = self.skip.load(Relaxed);
         let mut fill = (self.prod.occupied_len() / 2).saturating_sub(pending_skip);
         if ms(fill) < 8.0 {
-            let n = (margin_ms * dev / 1000.0) as usize;
+            let n = (rebuffer_ms * dev / 1000.0) as usize;
             self.push_silence(n);
             fill += n;
         }
@@ -280,7 +312,10 @@ impl Output {
         let err = low - margin_ms;
         let dead = 40.0;
         let eps = if err.abs() <= dead { 0.0 } else { (err - dead * err.signum()) / 10_000.0 };
-        self.speed = if self.burst_mode { 1.0 } else { 1.0 + eps.clamp(-0.03, 0.06) };
+        // chế độ theo đợt: tốc độ do `begin_burst` đặt cho cả lượt, không đổi giữa chừng
+        if !self.burst_mode {
+            self.speed = 1.0 + eps.clamp(-0.03, 0.06);
+        }
 
         // 5) resample (đồng thời đổi sample rate nguồn → thiết bị)
         let ratio = src_rate as f64 / dev * self.speed;
@@ -604,5 +639,28 @@ mod floor_tests {
         assert_eq!(burst_floor_ms(120.0), 1_000.0); // Siêu thấp
         assert!((burst_floor_ms(350.0) - 2_000.0).abs() < 10.0); // Cân bằng
         assert_eq!(burst_floor_ms(900.0), 4_500.0); // Ổn định
+    }
+
+    /// Bộ điều khiển theo lượt: đáy cao hơn đích → phát nhanh hơn; thấp hơn → chậm lại; luôn nằm trong [−3%, +6%].
+    #[test]
+    fn begin_burst_pulls_the_trough_toward_the_target_within_the_speed_limits() {
+        let wav = std::env::temp_dir().join(format!("fbaudio-burst-{}.wav", std::process::id()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut o = Output::new(Tuning { margin_ms: 120, slack_ms: 250 }, SinkKind::Wav(wav.clone()), stop).unwrap();
+        o.set_live(true);
+        o.set_burst_mode(true);
+        let pcm = vec![0.1f32; 44_100 * 2 * 4]; // 4 s stereo
+        o.push(&pcm, 44_100, 2); // started; đáy lúc này ≈ khoảng lặng chèn + 4 s
+        // đáy ≈ 4–5 s so với đích 1 s, chu kỳ 20 s: lệch ≈ +3,5 s ⇒ 1 + 0,5·3,5/20 ≈ 1,09 → bị chặn ở +6%
+        o.begin_burst(1_000.0, 20_000.0);
+        assert!((o.speed - 1.06).abs() < 1e-9, "tốc độ {}", o.speed);
+        // đích cao hơn hẳn đáy → chậm lại, chặn ở −3%
+        o.begin_burst(30_000.0, 20_000.0);
+        assert!((o.speed - 0.97).abs() < 1e-9, "tốc độ {}", o.speed);
+        // đích ≈ đáy → gần như không đổi tốc độ
+        let fill_ms = (o.prod.occupied_len() / 2) as f64 * 1000.0 / o.dev_rate as f64;
+        o.begin_burst(fill_ms, 20_000.0);
+        assert!((o.speed - 1.0).abs() < 0.005, "tốc độ {}", o.speed);
+        let _ = std::fs::remove_file(wav);
     }
 }

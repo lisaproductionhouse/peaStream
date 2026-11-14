@@ -18,5 +18,8 @@ mod output;
 mod player;
 mod source;
 
+/// Mã bản dựng. Tăng mỗi khi giao một gói mới.
+pub const BUILD_ID: &str = "r6";
+
 pub use player::{LatencyMode, Player, PlayerConfig, State, Status};
 pub use source::{split_args, update_ytdlp, Remote, Source, YtDlp};

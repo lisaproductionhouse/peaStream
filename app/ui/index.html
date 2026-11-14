@@ -242,6 +242,7 @@
     </div>
     <p class="hint" id="logPath"></p>
   </details>
+  <p class="hint" id="build" style="opacity:.55;margin-top:10px"></p>
 </main>
 
 <script>
@@ -252,7 +253,7 @@
     app: $('main'), url: $('#url'), paste: $('#paste'), play: $('#play'), level: $('#level'),
     state: $('#state'), sub: $('#sub'), modeHint: $('#modeHint'),
     buf: $('#buf'), under: $('#under'), kbps: $('#kbps'), hint: $('#hint'), note: $('#note'),
-    srv: $('#srv'), tok: $('#tok'), ytp: $('#ytp'), yta: $('#yta'), pathRow: $('#pathRow'), replay: $('#replay'), logPath: $('#logPath'),
+    srv: $('#srv'), tok: $('#tok'), ytp: $('#ytp'), yta: $('#yta'), pathRow: $('#pathRow'), replay: $('#replay'), logPath: $('#logPath'), build: $('#build'),
     modes: [...document.querySelectorAll('[data-mode]')],
   };
   const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
@@ -328,6 +329,7 @@
     el.buf.textContent = s === 'playing' ? `${st.buffer_ms} ms` : '–';
     el.under.textContent = String(st.underruns || 0);
     el.kbps.textContent = st.bitrate_kbps ? `${st.bitrate_kbps} kbps` : '–';
+    el.build.textContent = `Bản dựng lõi: ${st.build || 'cũ (chưa có mã bản dựng)'}`;
   }
 
   function flash(msg) {

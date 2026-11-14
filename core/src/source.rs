@@ -307,6 +307,7 @@ fn spawn(program: &OsStr, pre: &[&str], args: &[String], name: &'static str, own
         std::thread::spawn(move || {
             let mut r = io::BufReader::new(stderr);
             let mut line = Vec::new();
+            let mut logged = 0u32;
             loop {
                 line.clear();
                 if !matches!(r.read_until(b'\n', &mut line), Ok(n) if n > 0) {
@@ -319,6 +320,11 @@ fn spawn(program: &OsStr, pre: &[&str], args: &[String], name: &'static str, own
                         info.set_title(&t);
                     }
                 } else if !s.trim().is_empty() {
+                    // nhật ký: cho biết yt-dlp dùng bộ tải nào ([dashsegments] = gốc), cảnh báo thiếu ffmpeg, lỗi…
+                    if logged < 80 {
+                        logged += 1;
+                        log::debug!("{name}: {}", redact(s));
+                    }
                     let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
                     t.push_back(s.to_string());
                     if t.len() > 16 {
@@ -368,6 +374,52 @@ fn python_has_ytdlp(py: &OsStr) -> bool {
     c.args(["-c", "import yt_dlp"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     hide_console(&mut c);
     c.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Có ffmpeg dùng được không (chế độ liên tục của yt-dlp cần nó). Tìm theo thứ tự: `FBAUDIO_FFMPEG`, cạnh file chạy của app, cạnh
+/// yt-dlp, PATH. Nếu người dùng đã truyền `--ffmpeg-location` cho yt-dlp thì tin họ.
+pub fn ffmpeg_available(cfg: &YtDlp) -> bool {
+    if cfg.args.iter().any(|a| a == "--ffmpeg-location" || a.starts_with("--ffmpeg-location=")) {
+        return true;
+    }
+    let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let mut cands: Vec<OsString> = Vec::new();
+    if let Some(p) = std::env::var_os("FBAUDIO_FFMPEG").filter(|p| !p.is_empty()) {
+        cands.push(p);
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        cands.push(dir.join(exe).into_os_string());
+    }
+    if let Some(dir) = cfg.path.as_ref().and_then(|p| p.parent()) {
+        cands.push(dir.join(exe).into_os_string());
+    }
+    cands.push(exe.into()); // PATH
+    cands.into_iter().any(|c| {
+        let mut cmd = Command::new(&c);
+        cmd.arg("-version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        hide_console(&mut cmd);
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    })
+}
+
+/// Che URL (có thể mang mã truy cập đã ký) và cắt ngắn một dòng stderr trước khi ghi nhật ký.
+fn redact(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find("http") {
+        let tail = &rest[i..];
+        if tail.starts_with("http://") || tail.starts_with("https://") {
+            out.push_str(&rest[..i]);
+            out.push_str("<url>");
+            let end = tail.find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')').unwrap_or(tail.len());
+            rest = &tail[end..];
+        } else {
+            out.push_str(&rest[..i + 4]);
+            rest = &rest[i + 4..];
+        }
+    }
+    out.push_str(rest);
+    out.chars().take(200).collect()
 }
 
 /// ffmpeg đọc nhanh bằng chừng này lần thời gian thực để tiêu hết lịch sử (cửa sổ DVR) khi vào live; app bỏ
@@ -731,6 +783,36 @@ mod tests {
         for bad in ["null", "", "abc", r#""\ud83d""#, r#""\ud83dx""#, r#""\u12""#, r#""\q""#] {
             assert_eq!(parse_json_string(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn redact_hides_urls_and_truncates() {
+        assert_eq!(redact("[download] Got https://video.fbcdn.net/x.mp4?oh=SECRET&oe=1 ok"), "[download] Got <url> ok");
+        assert_eq!(redact("loi (https://a.b/c) roi"), "loi (<url>) roi");
+        assert_eq!(redact("không có url, httpd cũng thế"), "không có url, httpd cũng thế");
+        assert_eq!(redact(&"x".repeat(500)).chars().count(), 200);
+    }
+
+    #[test]
+    fn ffmpeg_detection_trusts_an_explicit_location_and_checks_the_given_binary() {
+        let y = |args: &[&str]| YtDlp { path: None, args: args.iter().map(|s| s.to_string()).collect(), auto_update: false, ffmpeg_live: true };
+        assert!(ffmpeg_available(&y(&["--ffmpeg-location", "/bất/kỳ"])));
+        assert!(ffmpeg_available(&y(&["--ffmpeg-location=/bất/kỳ"])));
+        // FBAUDIO_FFMPEG chỉ đọc ở hàm này nên đặt biến môi trường trong test không ảnh hưởng test khác
+        let dir = std::env::temp_dir().join(format!("fbaudio-ff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("ffmpeg-fake");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::thread::sleep(Duration::from_millis(80)); // tránh "Text file busy"
+            std::env::set_var("FBAUDIO_FFMPEG", &fake);
+            assert!(ffmpeg_available(&y(&[])));
+            std::env::remove_var("FBAUDIO_FFMPEG");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

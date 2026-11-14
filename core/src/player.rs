@@ -91,8 +91,11 @@ pub struct Status {
     pub note: Option<String>,
     /// Đang lấy luồng bằng cách nào: "ffmpeg (bám live)", "chạy lại từng lượt (~5,8 s/lượt)", "phát lại".
     pub mode: String,
-    /// Đệm đích hiện tại (ms): mức cài sẵn cộng phần tự nới sau các lần cạn.
+    /// Đệm đích hiện tại (ms): mức đệm cài sẵn, hoặc mức đích của bộ điều khiển theo lượt.
     pub reserve_ms: u32,
+    /// Mã bản dựng của lõi, hiện trên giao diện và ghi ở dòng đầu nhật ký: nhìn là biết đang chạy mã nào
+    /// (ghép tệp từ nhiều bản khác nhau rất dễ gây lỗi khó hiểu).
+    pub build: String,
 }
 
 impl Status {
@@ -109,6 +112,7 @@ impl Status {
             note: None,
             mode: String::new(),
             reserve_ms: 0,
+            build: crate::BUILD_ID.into(),
         }
     }
 }
@@ -345,6 +349,12 @@ struct Session {
     playing_ever: bool,
     /// Trung bình trượt thời gian một lượt chạy công cụ (ms), 0 nếu chưa đo.
     cycle_ms: f64,
+    /// Thời gian vài lượt gần nhất (ms): đo độ dao động chu kỳ để chọn đệm đích ở chế độ theo lượt.
+    run_hist: VecDeque<f64>,
+    /// Số lượt công cụ đã chạy xong.
+    runs: u32,
+    /// Live nhưng không thấy ffmpeg: không có chế độ liên tục, chỉ chạy lại từng lượt.
+    no_ffmpeg: bool,
     core_rate: u32,
     total: u64,
     au_bytes: u64,
@@ -360,6 +370,9 @@ impl Session {
             gate: live.then(Gate::new),
             playing_ever: false,
             cycle_ms: 0.0,
+            run_hist: VecDeque::new(),
+            runs: 0,
+            no_ffmpeg: false,
             core_rate: 48_000,
             total: 0,
             au_bytes: 0,
@@ -388,8 +401,16 @@ fn run(sh: &Shared, cfg: &PlayerConfig) -> Result<()> {
 
     let mut sess = Session::new(cfg.live);
     // Live: thử ffmpeg trước (độ trễ thấp nếu manifest sống), không được thì bộ tải gốc chạy lặp từng lượt.
+    // Không có ffmpeg thì cách 1 vô ích (yt-dlp âm thầm rơi về bộ tải gốc): bỏ qua và nói rõ cho người dùng.
+    if let Source::YtDlp(y) = &cfg.source {
+        if cfg.live && y.ffmpeg_live {
+            let have = source::ffmpeg_available(y);
+            sess.no_ffmpeg = !have;
+            log::info!("ffmpeg: {}", if have { "có" } else { "KHÔNG tìm thấy → chỉ chạy lại từng lượt (độ trễ cao)" });
+        }
+    }
     let mut strategy = match &cfg.source {
-        Source::YtDlp(y) if cfg.live && y.ffmpeg_live => Strategy::Ffmpeg,
+        Source::YtDlp(y) if cfg.live && y.ffmpeg_live && !sess.no_ffmpeg => Strategy::Ffmpeg,
         Source::Remote(_) if cfg.live => Strategy::Ffmpeg,
         _ => Strategy::Native,
     };
@@ -433,7 +454,8 @@ fn run(sh: &Shared, cfg: &PlayerConfig) -> Result<()> {
         let limit = if strategy == Strategy::Ffmpeg { FFMPEG_FIRST_BYTE_LIMIT_MS } else { FIRST_BYTE_LIMIT_MS };
         // bộ tải gốc chắc chắn sẽ thoát: chờ EOF để nhả đuôi, đừng tin vào khoảng im lặng
         let join = if strategy == Strategy::Ffmpeg { Join::Continuous } else { Join::Bounded };
-        let outcome = match pump(sh, opened, &mut out, &mut sess, limit, join) {
+        let burst_mode = (cfg.live && (strategy == Strategy::Native || sess.runs > 0)).then_some(cfg.latency);
+        let outcome = match pump(sh, opened, &mut out, &mut sess, limit, join, burst_mode) {
             Ok(o) => o,
             // cách 1 hỏng trước khi có tiếng đầu tiên (treo, định dạng lạ, lỗi đọc…) → lùi về cách 2
             Err(e) if strategy == Strategy::Ffmpeg && !sess.playing_ever && !sh.stopped() => {
@@ -483,8 +505,20 @@ fn run(sh: &Shared, cfg: &PlayerConfig) -> Result<()> {
         out.set_burst_mode(true);
         let run_ms = started.elapsed().as_secs_f64() * 1000.0;
         sess.cycle_ms = if sess.cycle_ms == 0.0 { run_ms } else { 0.7 * sess.cycle_ms + 0.3 * run_ms };
-        let cycle = sess.cycle_ms;
-        sh.update(|s| s.mode = format!("chạy lại từng lượt (~{:.1} s/lượt)", cycle / 1000.0));
+        sess.run_hist.push_back(run_ms);
+        if sess.run_hist.len() > 5 {
+            sess.run_hist.pop_front();
+        }
+        sess.runs += 1;
+        let (cycle, no_ffmpeg) = (sess.cycle_ms, sess.no_ffmpeg);
+        sh.update(|s| {
+            s.mode = format!(
+                "chạy lại từng lượt: mỗi lượt ~{:.0} s ⇒ trễ ≥ {:.0} s{}",
+                cycle / 1000.0,
+                cycle / 1000.0,
+                if no_ffmpeg { " · chưa có ffmpeg" } else { "" }
+            )
+        });
         log::info!("lượt xong sau {:.1} s: {new_aus} AU mới; chu kỳ trung bình {:.1} s", run_ms / 1000.0, cycle / 1000.0);
         if new_aus == 0 || err.is_some() {
             idle_runs += 1;
@@ -582,8 +616,56 @@ fn spawn_reader(mut stream: Box<dyn source::Stream>) -> std::sync::mpsc::Receive
     rx
 }
 
+/// Chế độ theo lượt: (đệm đích, chu kỳ) cho `Output::begin_burst`.
+///
+/// Đáy hàng đợi trượt theo chênh lệch thời gian giữa các lượt liên tiếp (lượt này dài hơn lượt trước bao nhiêu thì đáy tụt
+/// chừng đó), nên đệm cần chừng bấy nhiêu giây dao động: sàn theo mức người dùng chọn + hệ số × độ dao động đã đo
+/// (chênh lệch lớn nhất giữa hai lượt liên tiếp trong vài lượt gần nhất). Chưa đo được gì (mới có một lượt) thì tạm coi
+/// dao động bằng 25% chu kỳ.
+fn burst_target(sess: &Session, mode: LatencyMode, run_ms: f64) -> (f64, f64) {
+    let cycle = if sess.cycle_ms > 0.0 { sess.cycle_ms } else { run_ms };
+    let jitter = if sess.run_hist.len() >= 2 {
+        sess.run_hist.iter().zip(sess.run_hist.iter().skip(1)).map(|(a, b)| (b - a).abs()).fold(0.0, f64::max)
+    } else {
+        0.25 * cycle
+    };
+    let k = match mode {
+        LatencyMode::Ultra => 0.5,
+        LatencyMode::Balanced => 1.0,
+        LatencyMode::Stable => 1.5,
+    };
+    let floor = crate::output::burst_floor_ms(mode.tuning().margin_ms as f64);
+    ((floor + k * jitter).min(30_000.0), cycle)
+}
+
+/// Đẩy âm thanh vào bộ đệm phát. Ở chế độ theo lượt, lần đẩy ĐẦU TIÊN của mỗi lượt báo trước cho bộ điều khiển theo lượt.
+fn push_audio(
+    sh: &Shared,
+    out: &mut Output,
+    sess: &mut Session,
+    burst: &mut Option<LatencyMode>,
+    run_started: Instant,
+    p: &[f32],
+    rate: u32,
+    ch: usize,
+) {
+    if let Some(mode) = burst.take() {
+        let (target, cycle) = burst_target(sess, mode, run_started.elapsed().as_secs_f64() * 1000.0);
+        out.begin_burst(target, cycle);
+    }
+    out.push(p, rate, ch);
+    mark_playing(sh, sess);
+}
+
 /// Đưa PCM vừa giải mã qua cổng (nếu là live) rồi vào bộ đệm phát.
-fn deliver(sh: &Shared, out: &mut Output, sess: &mut Session, pcm: &mut Vec<f32>) {
+fn deliver(
+    sh: &Shared,
+    out: &mut Output,
+    sess: &mut Session,
+    pcm: &mut Vec<f32>,
+    burst: &mut Option<LatencyMode>,
+    run_started: Instant,
+) {
     if pcm.is_empty() {
         return;
     }
@@ -598,10 +680,7 @@ fn deliver(sh: &Shared, out: &mut Output, sess: &mut Session, pcm: &mut Vec<f32>
         },
     };
     match to_push {
-        Some((p, r, c)) => {
-            out.push(&p, r, c);
-            mark_playing(sh, sess);
-        }
+        Some((p, r, c)) => push_audio(sh, out, sess, burst, run_started, &p, r, c),
         None if !sess.playing_ever => sh.set(State::Connecting, "Đang bỏ qua phần lịch sử để vào live"),
         None => {}
     }
@@ -609,7 +688,7 @@ fn deliver(sh: &Shared, out: &mut Output, sess: &mut Session, pcm: &mut Vec<f32>
 }
 
 /// Một lượt chạy của công cụ: đọc tới hết luồng, đưa âm thanh mới vào `out`.
-fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first_byte_limit_ms: u64, join: Join) -> Result<Outcome> {
+fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first_byte_limit_ms: u64, join: Join, burst_mode: Option<LatencyMode>) -> Result<Outcome> {
     let Opened { stream, info, killer } = opened;
     let mon = Monitor::start(killer, first_byte_limit_ms);
     let rx = spawn_reader(stream);
@@ -619,6 +698,7 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
     }
 
     let run_started = Instant::now();
+    let mut burst = burst_mode; // Some = chế độ theo lượt: còn chờ báo `begin_burst` ở lần đẩy đầu tiên của lượt
     let mut demux = Demux::new();
     let mut pcm: Vec<f32> = Vec::new();
     let mut last_report = Instant::now();
@@ -648,8 +728,7 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
                 // công cụ đang im lặng: nếu một đợt giao vừa kết thúc thì nhả phần đang giữ / phần đuôi
                 let released = sess.gate.as_mut().and_then(|g| if g.tick(Instant::now()) { g.take() } else { None });
                 if let Some((p, rate, ch)) = released {
-                    out.push(&p, rate, ch);
-                    mark_playing(sh, sess);
+                    push_audio(sh, out, sess, &mut burst, run_started, &p, rate, ch);
                 }
                 continue;
             }
@@ -660,6 +739,7 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
 
         if first_data {
             first_data = false;
+            log::info!("lượt: byte đầu sau {:.1} s", run_started.elapsed().as_secs_f64());
             sh.update(|s| s.title = s.title.take().or_else(|| info.title()));
             if sess.gate.is_some() && !sess.playing_ever {
                 sh.set(State::Connecting, "Đã nhận dữ liệu, đang vào live");
@@ -701,7 +781,7 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
             Ok(())
         })?;
 
-        deliver(sh, out, sess, &mut pcm);
+        deliver(sh, out, sess, &mut pcm, &mut burst, run_started);
         if last_report.elapsed() >= Duration::from_secs(1) {
             last_report = Instant::now();
             report(sh, &info, sess);
@@ -722,16 +802,16 @@ fn pump(sh: &Shared, opened: Opened, out: &mut Output, sess: &mut Session, first
         if let Some(d) = sess.dec.as_mut() {
             d.decode(&ready, &mut pcm)?;
         }
-        deliver(sh, out, sess, &mut pcm);
+        deliver(sh, out, sess, &mut pcm, &mut burst, run_started);
     }
     // Phần đuôi dài bằng MỘT CHU KỲ lượt (tối thiểu 2,5 s): lượt kế tiếp chỉ về sau chừng đó, nên đuôi ngắn hơn thì đệm cạn
     // trước khi dữ liệu mới tới (đo: đuôi 2,5 s với lượt ~6 s gây khe 3,7 s ngay giây thứ 7).
     let cycle_tail_ms = (run_started.elapsed().as_secs_f64() * 1200.0).clamp(GATE_TAIL_MS, GATE_TAIL_MAX_MS);
     let released = sess.gate.as_mut().and_then(|g| if g.finish(cycle_tail_ms) { g.take() } else { None });
     if let Some((p, rate, ch)) = released {
-        out.push(&p, rate, ch);
-        mark_playing(sh, sess);
+        push_audio(sh, out, sess, &mut burst, run_started, &p, rate, ch);
     }
+    log::info!("lượt: hết luồng sau {:.1} s, đã đọc {} KB, {} AU mới", run_started.elapsed().as_secs_f64(), sess.total / 1024, sess.stitch.new_aus);
     report(sh, &info, sess); // lần báo cuối (luồng ngắn kết thúc trước chu kỳ 1 s)
     if sess.dedupe.dropped > 0 {
         log::debug!("đã loại {} access unit bị phát lặp tới giờ", sess.dedupe.dropped);
@@ -754,7 +834,7 @@ const GATE_LIVE_RATE: f64 = 1.6;
 /// Mặc định 2,5 s; khi công cụ thoát (lượt chạy lại) thì dài bằng một chu kỳ lượt, tối đa `GATE_TAIL_MAX_MS` (cũng là lượng
 /// đuôi được nhớ).
 const GATE_TAIL_MS: f64 = 2_500.0;
-const GATE_TAIL_MAX_MS: f64 = 12_000.0;
+const GATE_TAIL_MAX_MS: f64 = 45_000.0;
 
 #[derive(Debug, PartialEq)]
 enum Verdict {
@@ -1003,6 +1083,32 @@ mod gate_tests {
         assert_eq!(g.take().map(|(p, r, c)| (p.len(), r, c)), Some((1_500, 1000, 1)));
     }
 
+    fn sess_with_runs(runs: &[f64]) -> Session {
+        let mut s = Session::new(true);
+        s.run_hist = runs.iter().copied().collect();
+        s.cycle_ms = runs.last().copied().unwrap_or(0.0);
+        s
+    }
+
+    /// Đệm đích ở chế độ theo lượt phải co giãn theo độ dao động chu kỳ ĐÃ ĐO và theo mức người dùng chọn.
+    #[test]
+    fn burst_target_scales_with_the_measured_cycle_jitter_and_the_chosen_preset() {
+        // các lượt 14 s, 20 s, 15 s: chênh lệch lớn nhất giữa hai lượt liên tiếp = 6 s
+        let s = sess_with_runs(&[14_000.0, 20_000.0, 15_000.0]);
+        let t = |m| burst_target(&s, m, 15_000.0).0;
+        assert!((t(LatencyMode::Ultra) - (1_000.0 + 0.5 * 6_000.0)).abs() < 50.0, "{}", t(LatencyMode::Ultra));
+        assert!((t(LatencyMode::Balanced) - (2_000.0 + 6_000.0)).abs() < 50.0, "{}", t(LatencyMode::Balanced));
+        assert!((t(LatencyMode::Stable) - (4_500.0 + 9_000.0)).abs() < 50.0, "{}", t(LatencyMode::Stable));
+        assert!(t(LatencyMode::Ultra) < t(LatencyMode::Balanced) && t(LatencyMode::Balanced) < t(LatencyMode::Stable));
+        // mới có một lượt: chưa đo được dao động → tạm coi bằng 25% chu kỳ
+        let one = sess_with_runs(&[20_000.0]);
+        let (target, cycle) = burst_target(&one, LatencyMode::Balanced, 20_000.0);
+        assert!((target - (2_000.0 + 0.25 * 20_000.0)).abs() < 50.0 && cycle == 20_000.0, "{target} {cycle}");
+        // trần 30 s
+        let wild = sess_with_runs(&[5_000.0, 90_000.0]);
+        assert_eq!(burst_target(&wild, LatencyMode::Stable, 90_000.0).0, 30_000.0);
+    }
+
     #[test]
     fn tail_is_cut_on_a_channel_boundary() {
         let t0 = Instant::now();
@@ -1108,7 +1214,13 @@ mod tests {
             url: "https://www.facebook.com/x/videos/1".into(),
             latency: LatencyMode::Ultra,
             wav: Some(f.wav.clone()),
-            source: Source::YtDlp(YtDlp { path: Some(f.tool.clone()), args: vec![], auto_update: false, ffmpeg_live }),
+            // khai báo --ffmpeg-location để cách 1 được thử bất kể máy chạy test có ffmpeg hay không
+            source: Source::YtDlp(YtDlp {
+                path: Some(f.tool.clone()),
+                args: if ffmpeg_live { vec!["--ffmpeg-location".into(), "/giả".into()] } else { vec![] },
+                auto_update: false,
+                ffmpeg_live,
+            }),
             live: true,
         });
         assert!(p.wait_finished(Duration::from_secs(40)), "player không kết thúc");

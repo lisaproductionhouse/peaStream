@@ -5,11 +5,15 @@ một công cụ ngoài (yt-dlp) lo từ link tới luồng âm thanh và ghi ra
 
 ## Khi gặp lỗi: gửi gì để chẩn đoán
 
-Ứng dụng Windows không có console, nên mọi thứ cần thiết nằm ở ba nơi:
+Ứng dụng Windows không có console, nên mọi thứ cần thiết nằm ở bốn nơi:
 
-1. **Nhật ký:** `%TEMP%\fbaudio.log` (lần chạy trước: `fbaudio.old.log`; đường dẫn cũng hiện ở mục "Nâng cao"). Ghi cách đang lấy luồng
-   (ffmpeg hay chạy lại từng lượt), thời gian mỗi lượt, mọi lần lùi cách, và cứ 10 s một dòng tóm tắt đệm/số lần ngắt.
-2. **Dòng nhỏ dưới nút phát** khi đang phát: `ffmpeg (bám live) · đệm đích 0,4 s` hoặc `chạy lại từng lượt (~5,8 s/lượt) · đệm đích 2,0 s`.
+0. **Mã bản dựng** ở cuối cửa sổ (`Bản dựng lõi: r6`). Nếu thấy "cũ (chưa có mã bản dựng)" thì lõi đang chạy KHÔNG phải bản này: hãy thay nguyên
+   các thư mục `core`, `app/src-tauri`, `app/ui` từ cùng một gói (ghép tệp từ nhiều bản gây lỗi rất khó hiểu, ví dụ không hiện dòng mô tả dưới đây).
+1. **Nhật ký:** `%TEMP%\fbaudio.log` (lần chạy trước: `fbaudio.old.log`; đường dẫn cũng hiện ở mục "Nâng cao"). Dòng đầu là mã bản dựng. Ghi: có
+   ffmpeg không, cách đang lấy luồng, **mỗi lượt yt-dlp tốn bao lâu** (byte đầu sau bao lâu, hết luồng sau bao lâu), các dòng stderr của yt-dlp (đã che URL;
+   cho biết nó dùng bộ tải nào), mọi lần lùi cách, và cứ 10 s một dòng tóm tắt đệm/số lần ngắt.
+2. **Dòng nhỏ dưới nút phát** khi đang phát: `ffmpeg (bám live) · đệm đích 0,4 s` hoặc
+   `chạy lại từng lượt: mỗi lượt ~21 s ⇒ trễ ≥ 21 s · đệm đích 7,9 s` (kèm `· chưa có ffmpeg` nếu app không tìm thấy ffmpeg).
 3. `python scripts/probe_live.py "LINK" --cookies cookies.txt`: yt-dlp thấy gì, trang có cung cấp URL manifest không, manifest có
    thật sự tiến thêm đoạn mới không (tức là cách 1 có dùng được hay chỉ còn cách 2).
 
@@ -88,7 +92,12 @@ như mạng thật (`ALIAS_JITTER_MS`, `FBLIKE_DELAY/JITTER/SEED`).
   **tác dụng lên số lần ngắt chưa chứng minh được** vì nhiễu giữa các lần chạy (xem dưới).
 - **Đuôi lượt đầu quá ngắn ở cách 2:** đuôi 2,5 s trong khi một chu kỳ lượt ~6 s gây khe 3,7 s ngay giây thứ 7. Nay đuôi dài bằng 1,2 chu kỳ lượt đã đo (tối đa 12 s),
   và chỉ nhả khi EOF vì tiến trình thoát trễ vài trăm ms sau byte cuối.
-- **Cách 2 cần đệm sàn:** dữ liệu về theo cục nên đệm sàn theo mức người dùng chọn (Siêu thấp 1,0 s, Cân bằng 2,0 s, Ổn định 4,0 s).
+- **Cách 2: đệm là một bước đi ngẫu nhiên và cần lực kéo.** Mỗi lượt đổ về một cục dài bằng chu kỳ lượt (đo trên ảnh chụp của người dùng: đệm vọt lên ~16–21 s rồi tụt về
+  ~0, lặp đi lặp lại). Mỗi chu kỳ dài/ngắn hơn chu kỳ trước vài giây nên đáy hàng đợi lang thang và cứ chạm 0 là ngắt. Bản trước chỉ chèn đệm sàn một lần
+  và tắt điều tốc ở chế độ này. Nay: ngay trước cục mới, app đo **đáy** của chu kỳ vừa rồi rồi phát nhanh +6% / chậm −3% để kéo đáy về **mức đích**
+  (độ lợi 0,5 trên mỗi chu kỳ nên không dao động). Mức đích = sàn theo mức (Siêu thấp 1,0 s / Cân bằng 2,0 s / Ổn định 4,5 s) + hệ số (0,5 / 1,0 / 1,5) × **độ
+  dao động chu kỳ đã đo** (chênh lệch lớn nhất giữa hai lượt liên tiếp trong 5 lượt gần nhất), tối đa 30 s. Đuôi lượt đầu dài 1,2 chu kỳ (tối đa 45 s) thay vì
+  bị chặn ở 12 s; vòng đệm 90 s và trần backlog 80 s để cục 20 s + đệm không bị cắt. Chế độ này không còn cắt âm thanh theo "đáy" (mất nội dung).
 - **Máy chủ yt-dlp** ném `TypeError` ở nhánh lỗi (client chỉ nhận "HTTP 502" trống): đã sửa.
 
 **Đã thử rồi gỡ: đệm thích ứng** (nới đệm sau mỗi lần cạn). Ba biến thể, không biến thể nào cho ít lần ngắt hơn đệm cố định (4 so với 4–6), mà còn làm độ
@@ -120,8 +129,14 @@ bản debug, ghi WAV. Tín hiệu có mốc mã hoá hai âm (nhận dạng khô
 | cách 2, nguồn êm (lượt nhanh), cửa sổ 11 đoạn, Cân bằng | 2,7 s | 58 mốc liền, 0 khe | ≈ 5,4 s |
 | cách 2, **lượt chậm 3 s + dao động 0–4 s**, Cân bằng, 120 s | 8,7 s | 112 mốc liền, **0 khe, 0 lần ngắt** | ≈ 10,5 s |
 | qua máy chủ yt-dlp (đường Android), cách 1, lịch sử 30 s | 6,8 s | 34 mốc liền | ≈ 2,1 s (đo ở bản trước khi đổi cổng) |
+| **cách 2, lượt chậm ~14–20 s (như ảnh chụp của người dùng)**, Siêu thấp, 170 s, hạt giống 3 | 22,3 s | **0 lần ngắt** (trước khi sửa: 2 lần, khe 2,7 s và 5,2 s ở hai chu kỳ đầu) | ≈ 20 s |
+| như trên, hạt giống 11 (dao động khác) | 17,0 s | 1 lần ngắt (khe 2,7 s): lượt thứ 3 dài hơn lượt trước 4,3 s mà mức đích lúc đó chỉ 2,8 s | ≈ 21 s |
+| như trên (hạt giống 11), **Ổn định** | 18,7 s | **0 lần ngắt**, 148 mốc liền; đáy tụt tới 1,6 s ở lượt dài nhưng đệm đích 5–12 s đỡ được | ≈ 25 s |
 | phát lại (`--replay`, bộ tải gốc, không ffmpeg) | 0,5 s | 22 mốc liền, kết thúc gọn | — |
 
+- **Cách 2 không thể cho độ trễ thấp khi mỗi lượt tốn ~20 s**: độ trễ ≥ một chu kỳ cộng đệm đích (≈ 20–30 s). Bộ điều khiển chỉ làm cho nó *liền mạch* chứ không làm
+  nó nhanh. Mức "Siêu thấp" ở chế độ này vẫn có thể ngắt khi một lượt dài hơn lượt trước vài giây (đúng ý nghĩa của mức đó); "Ổn định" đệm lớn hơn nhiều. Muốn độ trễ
+  thấp thật sự phải thoát khỏi chế độ này: cài ffmpeg và kiểm tra bằng `probe_live.py` xem trang có cung cấp manifest sống không (cách 1).
 - **Độ trễ của cách 2 xấp xỉ một đến hai chu kỳ lượt** (mỗi lượt gồm khởi động yt-dlp + tải trang + trích xuất + tải cả cửa sổ) cộng đệm sàn. Trên localhost
   lượt chỉ ~2 s; trên Facebook thật chắc chắn lớn hơn, **chưa đo được**. Đổi lại cách 2 liền mạch (0 khe ở cả hai kịch bản đo).
 - **Cách 2 tốn dữ liệu:** mỗi lượt tải lại *cả cửa sổ*. Đo được 440 yêu cầu âm thanh (~10,4 MB) trong 60 s cho âm thanh 96 kbps (~0,7 MB thật), vì trên
@@ -148,6 +163,9 @@ bản debug, ghi WAV. Tín hiệu có mốc mã hoá hai âm (nhận dạng khô
   trước, yt-dlp map nhầm video và lỗi muxer; app lùi về cách 2.
 - ffmpeg mở **mọi** Representation lúc thăm dò. Đo được 2 yêu cầu video với 1 Representation video; Facebook có nhiều chất lượng nên có thể tải thêm một ít (chưa đo).
 - Cách 2 kết thúc khi 4 lượt liên tiếp (≥ 20 s) không có access unit mới hoặc yt-dlp báo lỗi. Một phiên live **im lặng tuyệt đối** hơn 20 s có thể bị coi nhầm là đã kết thúc.
+- **Chu kỳ lượt thật trên máy người dùng** (~20 s theo ảnh) chưa có nhật ký để biết thời gian đó mất ở đâu (khởi động `yt-dlp.exe`, tải trang, trích xuất, hay tải đoạn). Nhật ký mới ghi
+  riêng "byte đầu sau" và "hết luồng sau" cho mỗi lượt. Không chạy hai lượt chồng nhau để rút ngắn chu kỳ vì yt-dlp ghi lại tệp `cookies.txt` khi thoát: hai tiến trình cùng ghi có thể
+  làm hỏng nó.
 - **Windows/Android chưa biên dịch.** Mã `cfg(windows)` (`taskkill`, `CREATE_NO_WINDOW`) chưa được compile; dịch vụ nền Kotlin và JNI chưa dựng. Crate Tauri đã `cargo check` được trên Linux.
 - Số đo từ bản debug. Tự cập nhật `yt-dlp -U` chỉ được thử với yt-dlp giả.
 - HE-AAC: mặc định phát phần lõi (thiếu dải cao); `--features sbr` dùng FDK-AAC (giấy phép Fraunhofer riêng) cho đủ dải cao.
@@ -162,7 +180,7 @@ scripts/     probe_live.py (chẩn đoán link thật) · ytdlp_helper.py (máy 
              alias_server.py (nguồn giả lập, có ALIAS_JITTER_MS) · fblike-plugin/ (bắt chước extractor Facebook) · make-adts-fixtures.sh · he-fixtures/
 ```
 
-Test: `cargo test -p fbaudio-core` (42 test; đạt cả khi thêm `--features sbr`). Gồm yt-dlp giả bằng shell script (phát đủ, hiện dòng lỗi, Dừng diệt cả cây tiến
+Test: `cargo test -p fbaudio-core` (đạt cả khi thêm `--features sbr`). Gồm yt-dlp giả bằng shell script (phát đủ, hiện dòng lỗi, Dừng diệt cả cây tiến
 trình, tự cập nhật, thư mục tạm được dọn, cửa sổ hữu hạn chạy lại và nối tiếp không phát lặp, ffmpeg hỏng/treo thì lùi), cổng vào live (đoạn 2 s và 4 s, lịch sử đổ
 về với độ trễ mạng, lượt đầu của bộ tải gốc), bộ lọc lặp (bội 2, 4, dải phát lại, im lặng, AU đứng một mình), tiêu đề JSON.
 

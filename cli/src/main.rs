@@ -77,6 +77,9 @@ fn main() -> anyhow::Result<()> {
         log::set_logger(&LOGGER).ok();
         log::set_max_level(log::LevelFilter::Debug);
     }
+    if verbose {
+        eprintln!("[fbaudio] lõi bản dựng {}", fbaudio_core::BUILD_ID);
+    }
 
     if update_only {
         match update_ytdlp(&ytdlp) {

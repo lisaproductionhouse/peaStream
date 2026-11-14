@@ -152,6 +152,7 @@ pub extern "system" fn Java_com_fbaudio_live_PlaybackService_nativeIsActive(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_log();
+    log::info!("FB Live Audio, lõi bản dựng {}", fbaudio_core::BUILD_ID);
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![start, stop, status, log_path])
         .run(tauri::generate_context!())
